@@ -1,0 +1,26 @@
+{
+  "config_schema_version": "experiment_config_v1",
+  "experiment_name": "hard_filter_v1_soft_ranking_v1",
+  "description": "Начальная, не оптимизированная политика жёсткой фильтрации и настраиваемого мягкого ранжирования.",
+  "policy": {
+    "version": "hard_filter_v1",
+    "rules": {
+      "low_detection_score": {"mode": "hard"},
+      "small_face": {"mode": "hard"},
+      "blurred": {"mode": "hard"},
+      "large_yaw": {"mode": "hard"},
+      "large_pitch": {"mode": "hard"},
+      "large_roll": {"mode": "hard"},
+      "pose_unavailable": {"mode": "shadow"},
+      "face_near_border": {"mode": "shadow"},
+      "too_dark": {"mode": "shadow"},
+      "too_bright": {"mode": "shadow"},
+      "extreme_dark_pixels": {"mode": "shadow"},
+      "extreme_bright_pixels": {"mode": "shadow"},
+      "image_unavailable": {"mode": "hard"}
+    }
+  },
+  "ranking": {
+    "version": "soft_ranking_v1"
+  }
+}

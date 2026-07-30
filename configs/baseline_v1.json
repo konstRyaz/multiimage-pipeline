@@ -1,0 +1,11 @@
+{
+  "config_schema_version": "experiment_config_v1",
+  "experiment_name": "baseline_v1",
+  "description": "Фиксация исходного поведения: подозрительные признаки записываются, но не блокируют лица.",
+  "policy": {
+    "version": "baseline_v1"
+  },
+  "ranking": {
+    "version": "baseline_quality_v1"
+  }
+}

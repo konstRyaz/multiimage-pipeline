@@ -15,6 +15,23 @@
 7. удаление почти одинаковых кадров и выбор качественных разнообразных лиц;
 8. сохранение крупных кропов из исходных кадров только для выбранных лиц.
 
+Для воспроизводимых экспериментов фильтрации добавлен отдельный совместимый
+контур. Он не меняет тяжёлые результаты и позволяет сравнивать политики без
+повторного запуска InsightFace:
+
+```text
+faces.csv + embeddings.npy + aligned_faces/
+  → независимые признаки
+  → политика off/shadow/hard
+  → жёсткая фильтрация
+  → дорожки и кластеризация
+  → мягкий рейтинг
+  → дедупликация и разнообразие
+```
+
+Полное описание схем, конфигураций, результатов и команд находится в
+[`docs/quality_experiments.md`](docs/quality_experiments.md).
+
 Исходные `faces.csv`, `embeddings.npy` и `aligned_faces/` последующие этапы не
 изменяют.
 
@@ -56,6 +73,25 @@ PY
 ```bash
 python src/run_pipeline.py \
   --run-dir runs/what_people_enjoy_full
+```
+
+Прежние команды остаются совместимыми и без конфигурации воспроизводят старое
+поведение. Новый эксперимент запускается отдельно:
+
+```bash
+python src/run_experiment.py \
+  --run-dir runs/what_people_enjoy_full \
+  --config configs/baseline_v1.json
+```
+
+Сравнение двух целевых конфигураций на одном кэше:
+
+```bash
+python src/compare_experiments.py \
+  --run-dir runs/what_people_enjoy_full \
+  --configs \
+    configs/baseline_v1.json \
+    configs/hard_filter_v1_soft_ranking_v1.json
 ```
 
 Стартовые значения `0.38` для дорожек и `0.45` для личностей намеренно вынесены
