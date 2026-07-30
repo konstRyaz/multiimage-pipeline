@@ -17,10 +17,17 @@ def main() -> None:
     parser.add_argument("--max-frame-gap", type=int, default=8)
     parser.add_argument("--min-similarity", type=float, default=0.38)
     parser.add_argument("--appearance-weight", type=float, default=0.85)
+    parser.add_argument("--quality-weight-offset", type=float, default=0.5)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
-    summary = run_tracking(args.run_dir, args.overwrite, args.max_frame_gap,
-                           args.min_similarity, args.appearance_weight)
+    summary = run_tracking(
+        args.run_dir,
+        overwrite=args.overwrite,
+        max_frame_gap=args.max_frame_gap,
+        min_similarity=args.min_similarity,
+        appearance_weight=args.appearance_weight,
+        quality_weight_offset=args.quality_weight_offset,
+    )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

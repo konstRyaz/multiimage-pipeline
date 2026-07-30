@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -21,6 +22,8 @@ from face_pipeline.clustering import run_clustering
 from face_pipeline.selection import run_selection
 from face_pipeline.tracking import run_tracking
 from generate_synthetic import run as generate_synthetic
+import select_faces as select_faces_cli
+import track_faces as track_faces_cli
 
 
 def resolved_config(path: Path, run_dir: Path, experiments_dir: Path, labels: Path | None = None):
@@ -31,6 +34,24 @@ def resolved_config(path: Path, run_dir: Path, experiments_dir: Path, labels: Pa
         experiments_dir,
         labels,
     )
+
+
+def _manual_run(root: Path, rows: list[dict[str, object]]) -> Path:
+    run_dir = root / "manual"
+    run_dir.mkdir(parents=True)
+    image = Image.new("RGB", (64, 64), (120, 120, 120))
+    for name in {"source_good.png", "aligned_good.png", "source_bad.png", "aligned_bad.png"}:
+        image.save(run_dir / name)
+    write_csv(run_dir / "faces.csv", rows)
+    embeddings = np.asarray([[1.0, 0.0], [0.0, 1.0]][: len(rows)], dtype=np.float32)
+    if len(rows) == 1:
+        embeddings = np.asarray([[1.0, 0.0]], dtype=np.float32)
+    save_npy(run_dir / "embeddings.npy", embeddings)
+    return run_dir
+
+
+def _read_jsonl(path: Path) -> list[dict[str, object]]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 class ExperimentTests(unittest.TestCase):
@@ -148,8 +169,8 @@ class ExperimentTests(unittest.TestCase):
             self.assertTrue(
                 absolute["hard_filter_v1_soft_ranking_v1"]["feature_cache"]["hit"]
             )
-            self.assertGreaterEqual(
-                absolute["hard_filter_v1_soft_ranking_v1"]["classification"]["f1"], 0.98
+            self.assertEqual(
+                absolute["hard_filter_v1_soft_ranking_v1"]["classification"]["f1"], 1.0
             )
             hard_run = next(
                 Path(row["run_dir"])
@@ -195,6 +216,286 @@ class ExperimentTests(unittest.TestCase):
                 "counts.rejected",
                 result["deltas_from_baseline"]["hard_filter_v1_soft_ranking_v1"],
             )
+
+    def test_rejected_face_is_excluded_from_ranking_and_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rows = [
+                {
+                    "face_id": "good",
+                    "source_frame": "source_good.png",
+                    "video_name": "v",
+                    "frame_number": 1,
+                    "face_index": 0,
+                    "bbox_x1": 8,
+                    "bbox_y1": 8,
+                    "bbox_x2": 48,
+                    "bbox_y2": 48,
+                    "face_width": 40,
+                    "face_height": 40,
+                    "frame_width": 64,
+                    "frame_height": 64,
+                    "border_margin": 8,
+                    "det_score": 0.99,
+                    "pitch": 0.0,
+                    "yaw": 0.0,
+                    "roll": 0.0,
+                    "blur_score": 40.0,
+                    "aligned_path": "aligned_good.png",
+                    "embedding_index": 0,
+                    "cluster_id": "",
+                    "rejection_reason": "",
+                },
+                {
+                    "face_id": "bad",
+                    "source_frame": "source_bad.png",
+                    "video_name": "v",
+                    "frame_number": 2,
+                    "face_index": 1,
+                    "bbox_x1": 8,
+                    "bbox_y1": 8,
+                    "bbox_x2": 48,
+                    "bbox_y2": 48,
+                    "face_width": 40,
+                    "face_height": 40,
+                    "frame_width": 64,
+                    "frame_height": 64,
+                    "border_margin": 8,
+                    "det_score": 0.10,
+                    "pitch": 0.0,
+                    "yaw": 0.0,
+                    "roll": 0.0,
+                    "blur_score": 1000.0,
+                    "aligned_path": "aligned_bad.png",
+                    "embedding_index": 1,
+                    "cluster_id": "",
+                    "rejection_reason": "",
+                },
+            ]
+            run_dir = _manual_run(root, rows)
+            config = resolved_config(
+                ROOT / "configs" / "hard_filter_v1_soft_ranking_v1.json",
+                run_dir,
+                run_dir / "experiments",
+            )
+            result = run_experiment(config, ROOT)
+            experiment_dir = Path(result["run_dir"])
+            ranking_rows = _read_jsonl(experiment_dir / "ranking_results.jsonl")
+            self.assertEqual(len(ranking_rows), 1)
+            self.assertEqual(ranking_rows[0]["face_id"], "good")
+            self.assertEqual(
+                [row["face_id"] for row in read_csv(experiment_dir / "pipeline" / "tracking" / "faces_tracked.csv")],
+                ["good"],
+            )
+            self.assertEqual(
+                [row["face_id"] for row in read_csv(experiment_dir / "pipeline" / "clustering" / "faces_clustered.csv")],
+                ["good"],
+            )
+            self.assertNotIn(
+                "bad",
+                [row["face_id"] for row in read_csv(experiment_dir / "pipeline" / "selected" / "selection.csv")],
+            )
+
+    def test_rejected_face_does_not_change_ranking_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            accepted_rows = [
+                {
+                    "face_id": "good",
+                    "source_frame": "source_good.png",
+                    "video_name": "v",
+                    "frame_number": 1,
+                    "face_index": 0,
+                    "bbox_x1": 8,
+                    "bbox_y1": 8,
+                    "bbox_x2": 48,
+                    "bbox_y2": 48,
+                    "face_width": 40,
+                    "face_height": 40,
+                    "frame_width": 64,
+                    "frame_height": 64,
+                    "border_margin": 8,
+                    "det_score": 0.99,
+                    "pitch": 0.0,
+                    "yaw": 0.0,
+                    "roll": 0.0,
+                    "blur_score": 40.0,
+                    "aligned_path": "aligned_good.png",
+                    "embedding_index": 0,
+                    "cluster_id": "",
+                    "rejection_reason": "",
+                }
+            ]
+            combined_rows = accepted_rows + [
+                {
+                    "face_id": "bad",
+                    "source_frame": "source_bad.png",
+                    "video_name": "v",
+                    "frame_number": 2,
+                    "face_index": 1,
+                    "bbox_x1": 8,
+                    "bbox_y1": 8,
+                    "bbox_x2": 48,
+                    "bbox_y2": 48,
+                    "face_width": 40,
+                    "face_height": 40,
+                    "frame_width": 64,
+                    "frame_height": 64,
+                    "border_margin": 8,
+                    "det_score": 0.10,
+                    "pitch": 0.0,
+                    "yaw": 0.0,
+                    "roll": 0.0,
+                    "blur_score": 1000.0,
+                    "aligned_path": "aligned_bad.png",
+                    "embedding_index": 1,
+                    "cluster_id": "",
+                    "rejection_reason": "",
+                },
+            ]
+            single_dir = _manual_run(root / "single", accepted_rows)
+            combined_dir = _manual_run(root / "combined", combined_rows)
+            config_single = resolved_config(
+                ROOT / "configs" / "hard_filter_v1_soft_ranking_v1.json",
+                single_dir,
+                single_dir / "experiments",
+            )
+            config_combined = resolved_config(
+                ROOT / "configs" / "hard_filter_v1_soft_ranking_v1.json",
+                combined_dir,
+                combined_dir / "experiments",
+            )
+            single = run_experiment(config_single, ROOT)
+            combined = run_experiment(config_combined, ROOT)
+            single_ranking = _read_jsonl(Path(single["run_dir"]) / "ranking_results.jsonl")
+            combined_ranking = _read_jsonl(Path(combined["run_dir"]) / "ranking_results.jsonl")
+            self.assertEqual(len(single_ranking), 1)
+            self.assertEqual(len(combined_ranking), 1)
+            self.assertEqual(single_ranking[0]["face_id"], "good")
+            self.assertEqual(combined_ranking[0]["face_id"], "good")
+            self.assertEqual(single_ranking[0]["soft_rating"], combined_ranking[0]["soft_rating"])
+            self.assertEqual(
+                single_ranking[0]["detection_component"],
+                combined_ranking[0]["detection_component"],
+            )
+            self.assertEqual(
+                single_ranking[0]["size_component"],
+                combined_ranking[0]["size_component"],
+            )
+            self.assertEqual(
+                single_ranking[0]["sharpness_component"],
+                combined_ranking[0]["sharpness_component"],
+            )
+            self.assertEqual(
+                single_ranking[0]["pose_component"],
+                combined_ranking[0]["pose_component"],
+            )
+
+    def test_empty_after_policy_filter_completes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            rows = [
+                {
+                    "face_id": "bad",
+                    "source_frame": "source_bad.png",
+                    "video_name": "v",
+                    "frame_number": 1,
+                    "face_index": 0,
+                    "bbox_x1": 8,
+                    "bbox_y1": 8,
+                    "bbox_x2": 48,
+                    "bbox_y2": 48,
+                    "face_width": 40,
+                    "face_height": 40,
+                    "frame_width": 64,
+                    "frame_height": 64,
+                    "border_margin": 8,
+                    "det_score": 0.10,
+                    "pitch": 0.0,
+                    "yaw": 0.0,
+                    "roll": 0.0,
+                    "blur_score": 1000.0,
+                    "aligned_path": "aligned_bad.png",
+                    "embedding_index": 0,
+                    "cluster_id": "",
+                    "rejection_reason": "",
+                }
+            ]
+            run_dir = _manual_run(root, rows)
+            config = resolved_config(
+                ROOT / "configs" / "hard_filter_v1_soft_ranking_v1.json",
+                run_dir,
+                run_dir / "experiments",
+            )
+            result = run_experiment(config, ROOT)
+            experiment_dir = Path(result["run_dir"])
+            self.assertEqual(result["metadata"]["status"], "complete")
+            self.assertEqual(result["metrics"]["counts"]["accepted"], 0)
+            self.assertEqual(result["metrics"]["counts"]["selected"], 0)
+            self.assertEqual(
+                _read_jsonl(experiment_dir / "ranking_results.jsonl"),
+                [],
+            )
+            self.assertEqual(
+                read_csv(experiment_dir / "pipeline" / "selected" / "selection.csv"),
+                [],
+            )
+
+    def test_synthetic_ground_truth_marks_quality_and_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "synthetic"
+            generate_synthetic(run_dir, seed=42, overwrite=False)
+            truth_rows = read_csv(run_dir / "ground_truth.csv")
+            face_rows = read_csv(run_dir / "faces.csv")
+            truth_by_face = {row["face_id"]: row for row in truth_rows}
+            face_by_face = {row["face_id"]: row for row in face_rows}
+            self.assertIn("is_acceptable", truth_rows[0])
+            self.assertTrue(all("is_acceptable" in row for row in truth_rows))
+            self.assertTrue(all(
+                int(truth_by_face[face_id]["is_acceptable"]) == int(
+                    row["true_person"] != "noise" and float(face_by_face[face_id]["blur_score"]) >= 20.0
+                )
+                for face_id, row in truth_by_face.items()
+            ))
+            noise_faces = [
+                row["face_id"] for row in truth_rows if row["true_person"] == "noise"
+            ]
+            self.assertTrue(noise_faces)
+            self.assertTrue(all(int(truth_by_face[face_id]["is_acceptable"]) == 0 for face_id in noise_faces))
+            blurred_faces = [
+                row["face_id"]
+                for row in face_rows
+                if float(row["blur_score"]) < 20.0
+            ]
+            self.assertTrue(blurred_faces)
+            self.assertTrue(all(int(truth_by_face[face_id]["is_acceptable"]) == 0 for face_id in blurred_faces))
+            real_faces = [
+                row["face_id"]
+                for row in truth_rows
+                if row["true_person"] != "noise" and float(face_by_face[row["face_id"]]["blur_score"]) >= 20.0
+            ]
+            self.assertTrue(real_faces)
+            self.assertTrue(all(int(truth_by_face[face_id]["is_acceptable"]) == 1 for face_id in real_faces))
+
+    def test_cli_commands_forward_new_arguments_and_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            run_dir = Path(temp) / "run"
+            run_dir.mkdir()
+            with patch.object(select_faces_cli, "run_selection", return_value={"ok": True}) as mocked:
+                with patch.object(sys, "argv", ["select_faces.py", "--run-dir", str(run_dir)]):
+                    select_faces_cli.main()
+                self.assertEqual(mocked.call_args.kwargs["hash_size"], 8)
+                with patch.object(sys, "argv", ["select_faces.py", "--run-dir", str(run_dir), "--hash-size", "12"]):
+                    select_faces_cli.main()
+                self.assertEqual(mocked.call_args.kwargs["hash_size"], 12)
+
+            with patch.object(track_faces_cli, "run_tracking", return_value={"ok": True}) as mocked:
+                with patch.object(sys, "argv", ["track_faces.py", "--run-dir", str(run_dir)]):
+                    track_faces_cli.main()
+                self.assertEqual(mocked.call_args.kwargs["quality_weight_offset"], 0.5)
+                with patch.object(sys, "argv", ["track_faces.py", "--run-dir", str(run_dir), "--quality-weight-offset", "0.75"]):
+                    track_faces_cli.main()
+                self.assertEqual(mocked.call_args.kwargs["quality_weight_offset"], 0.75)
 
 
 if __name__ == "__main__":

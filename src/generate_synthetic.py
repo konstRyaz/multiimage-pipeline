@@ -130,10 +130,20 @@ def run(output_dir: Path, seed: int, overwrite: bool) -> dict[str, int]:
                 "embedding_index": embedding_index,
                 "cluster_id": "", "rejection_reason": "",
             })
-            truths.append({"face_id": face_id, "true_person": person, "is_noise": int(person == "noise")})
+            is_acceptable = int(person != "noise" and blur_score >= 20.0)
+            truths.append({
+                "face_id": face_id,
+                "true_person": person,
+                "is_noise": int(person == "noise"),
+                "is_acceptable": is_acceptable,
+            })
 
     write_csv(output_dir / "faces.csv", rows)
-    write_csv(output_dir / "ground_truth.csv", truths, ["face_id", "true_person", "is_noise"])
+    write_csv(
+        output_dir / "ground_truth.csv",
+        truths,
+        ["face_id", "true_person", "is_noise", "is_acceptable"],
+    )
     save_npy(output_dir / "embeddings.npy", np.stack(embeddings).astype(np.float32))
     summary = {"frames_with_faces": len(schedule()), "faces": len(rows), "real_identities": 3, "noise_faces": 3}
     write_json(output_dir / "run_config.json", {"synthetic": True, "seed": seed, **summary})

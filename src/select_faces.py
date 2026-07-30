@@ -19,11 +19,19 @@ def main() -> None:
     parser.add_argument("--min-frame-gap", type=int, default=8)
     parser.add_argument("--source-margin", type=float, default=0.35)
     parser.add_argument("--include-unknown", action="store_true")
+    parser.add_argument("--hash-size", type=int, default=8)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
-    summary = run_selection(args.run_dir, args.overwrite, args.max_per_identity,
-                            args.duplicate_hamming, args.min_frame_gap,
-                            args.source_margin, args.include_unknown)
+    summary = run_selection(
+        args.run_dir,
+        overwrite=args.overwrite,
+        max_per_identity=args.max_per_identity,
+        duplicate_hamming=args.duplicate_hamming,
+        min_frame_gap=args.min_frame_gap,
+        source_margin=args.source_margin,
+        include_unknown=args.include_unknown,
+        hash_size=args.hash_size,
+    )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

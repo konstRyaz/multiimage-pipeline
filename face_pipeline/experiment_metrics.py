@@ -70,6 +70,8 @@ def load_labels(
             raise ValueError(f"Повторяющийся face_id в разметке: {face_id}")
         if has_positive_column:
             labels[face_id] = row[positive_column].strip().lower() in accepted_values
+        elif "is_acceptable" in row:
+            labels[face_id] = row["is_acceptable"].strip().lower() in accepted_values
         elif has_noise_column:
             labels[face_id] = row["is_noise"].strip().lower() not in accepted_values
         else:

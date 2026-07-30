@@ -97,6 +97,10 @@ def _prepare_stage(
         shutil.copy2(source_config, stage_dir / "source_run_config.json")
 
 
+def _features_by_face(features: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {row["face_id"]: row for row in features}
+
+
 def _empty_stage_outputs(stage_dir: Path) -> None:
     for name in ("tracking", "clustering", "selected"):
         (stage_dir / name).mkdir(parents=True, exist_ok=True)
@@ -118,7 +122,7 @@ def _empty_stage_outputs(stage_dir: Path) -> None:
 
 
 def _ranking_results(
-    policy_rows: list[dict[str, Any]],
+    accepted_policy_rows: list[dict[str, Any]],
     rating_rows: list[dict[str, float]],
     clustered_rows: list[dict[str, str]],
     selection_rows: list[dict[str, str]],
@@ -128,12 +132,11 @@ def _ranking_results(
     selected = {row["face_id"] for row in selection_rows}
     decisions = {row["face_id"]: row for row in decision_rows}
     output: list[dict[str, Any]] = []
-    for policy, rating in zip(policy_rows, rating_rows):
+    rating_by_face = {row["face_id"]: rating for row, rating in zip(accepted_policy_rows, rating_rows)}
+    for policy in accepted_policy_rows:
         face_id = policy["face_id"]
-        if not policy["accepted"]:
-            selection_decision = "not_eligible"
-            reasons = ["rejected_by_policy"]
-        elif face_id in selected:
+        rating = rating_by_face.get(face_id)
+        if face_id in selected:
             selection_decision = "selected"
             reasons = []
         elif face_id in decisions:
@@ -149,11 +152,11 @@ def _ranking_results(
             "embedding_index": policy["embedding_index"],
             "feature_schema_version": policy["feature_schema_version"],
             "policy_version": policy["policy_version"],
-            "ranking_version": None if not policy["accepted"] else "",
-            "accepted": policy["accepted"],
+            "ranking_version": "",
+            "accepted": True,
             "reject_reasons": policy["reject_reasons"],
             "shadow_reasons": policy["shadow_reasons"],
-            **rating,
+            **(rating or {}),
             "cluster_id": cluster_by_face.get(face_id),
             "selection_decision": selection_decision,
             "not_selected_reasons": reasons,
@@ -205,7 +208,10 @@ def run_experiment(
 
         moment = time.perf_counter()
         policy_rows = apply_policy_rows(features, config["policy"])
-        rating_rows, rating_context = soft_ratings(features, config["ranking"])
+        feature_by_face = _features_by_face(features)
+        accepted_policy_rows = [row for row in policy_rows if row["accepted"]]
+        accepted_features = [feature_by_face[row["face_id"]] for row in accepted_policy_rows]
+        rating_rows, rating_context = soft_ratings(accepted_features, config["ranking"])
         timings["policy"] = time.perf_counter() - moment
         _write_jsonl(temp_dir / "policy_results.jsonl", policy_rows)
         write_csv(
@@ -222,10 +228,10 @@ def run_experiment(
 
         source_rows = read_csv(source_run / "faces.csv")
         source_embeddings = np.load(source_run / "embeddings.npy", allow_pickle=False)
-        accepted_ids = {row["face_id"] for row in policy_rows if row["accepted"]}
+        accepted_ids = {row["face_id"] for row in accepted_policy_rows}
         rating_by_face = {
-            policy["face_id"]: rating["soft_rating"]
-            for policy, rating in zip(policy_rows, rating_rows)
+            row["face_id"]: rating["soft_rating"]
+            for row, rating in zip(accepted_policy_rows, rating_rows)
         }
         stage_dir = temp_dir / "pipeline"
         _prepare_stage(
@@ -301,11 +307,10 @@ def run_experiment(
         selection_rows = read_csv(stage_dir / "selected" / "selection.csv")
         decision_rows = read_csv(stage_dir / "selected" / "selection_decisions.csv")
         ranking_results = _ranking_results(
-            policy_rows, rating_rows, clustered_rows, selection_rows, decision_rows
+            accepted_policy_rows, rating_rows, clustered_rows, selection_rows, decision_rows
         )
         for row in ranking_results:
-            if row["accepted"]:
-                row["ranking_version"] = config["ranking"]["version"]
+            row["ranking_version"] = config["ranking"]["version"]
         _write_jsonl(temp_dir / "ranking_results.jsonl", ranking_results)
 
         labels_config = config["labels"]
