@@ -18,9 +18,9 @@ from pathlib import Path
 WIDER_TRAIN_ID = "15hGDLhsx8bLgLcIRD5DhYt5iBxnjNF1M"
 WIDER_VAL_ID = "1GUCogbp16PMGa39thoMMeWxp7Rp5oM8Q"
 WIDER_SPLIT_URL = (
-    "https://shuoyang1213.me/WIDERFACE/support/bbx_annotation/wider_face_split.zip"
+    "https://mmlab.ie.cuhk.edu.hk/projects/WIDERFace/support/bbx_annotation/wider_face_split.zip"
 )
-WIDER_EVAL_URL = "https://shuoyang1213.me/WIDERFACE/support/eval_script/eval_tools.zip"
+WIDER_EVAL_URL = "https://mmlab.ie.cuhk.edu.hk/projects/WIDERFace/support/eval_script/eval_tools.zip"
 XQLFW_BASE = "https://github.com/Martlgap/xqlfw/releases/download/1.0"
 CELEBA_FOLDER_URL = (
     "https://drive.google.com/drive/folders/0B7EVK8r0v71pWEZsZE9oNnFzTm8"
@@ -249,8 +249,8 @@ def verify_xqlfw(root: Path) -> list[str]:
     base = root / "xqlfw"
     errors: list[str] = []
     count = image_count(base)
-    if count != 7263:
-        errors.append(f"XQLFW: ожидалось 7263 изображения, найдено {count}")
+    if count != 13233:
+        errors.append(f"XQLFW: ожидалось 13233 изображения, найдено {count}")
     pairs = base / "xqlfw_pairs.txt"
     scores = base / "xqlfw_scores.txt"
     if not pairs.is_file() or not pairs.stat().st_size:
