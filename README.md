@@ -32,6 +32,10 @@ faces.csv + embeddings.npy + aligned_faces/
 Полное описание схем, конфигураций, результатов и команд находится в
 [`docs/quality_experiments.md`](docs/quality_experiments.md).
 
+Загрузка и строгая проверка WIDER FACE validation, исходного XQLFW и CelebA
+описаны в [`docs/baseline_datasets.md`](docs/baseline_datasets.md). Установщик
+работает без `sudo` и не изменяет системный Python.
+
 Исходные `faces.csv`, `embeddings.npy` и `aligned_faces/` последующие этапы не
 изменяют.
 
