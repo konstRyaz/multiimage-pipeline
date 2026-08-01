@@ -1,0 +1,4 @@
+-r requirements-insightface.txt
+
+# Масштабируемый пороговый граф CelebA без матрицы N x N.
+faiss-cpu>=1.8,<2

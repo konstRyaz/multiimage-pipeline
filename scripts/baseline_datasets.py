@@ -15,6 +15,7 @@ import zipfile
 from pathlib import Path
 
 
+WIDER_TRAIN_ID = "15hGDLhsx8bLgLcIRD5DhYt5iBxnjNF1M"
 WIDER_VAL_ID = "1GUCogbp16PMGa39thoMMeWxp7Rp5oM8Q"
 WIDER_SPLIT_URL = (
     "https://shuoyang1213.me/WIDERFACE/support/bbx_annotation/wider_face_split.zip"
@@ -104,16 +105,20 @@ def download_wider(root: Path) -> None:
     base = root / "widerface"
     downloads = base / "downloads"
     downloads.mkdir(parents=True, exist_ok=True)
+    train_archive = downloads / "WIDER_train.zip"
     val_archive = downloads / "WIDER_val.zip"
     split_archive = downloads / "wider_face_split.zip"
     eval_archive = downloads / "eval_tools.zip"
-    say("\n[1/3] WIDER FACE validation")
+    say("\n[1/3] WIDER FACE train и validation")
+    if not train_archive.exists():
+        run_gdown(["--continue", "--id", WIDER_TRAIN_ID, "-O", str(train_archive)])
     if not val_archive.exists():
         run_gdown(["--continue", "--id", WIDER_VAL_ID, "-O", str(val_archive)])
     if not split_archive.exists():
         download_http(WIDER_SPLIT_URL, split_archive)
     if not eval_archive.exists():
         download_http(WIDER_EVAL_URL, eval_archive)
+    extract_zip(train_archive, base)
     extract_zip(val_archive, base)
     extract_zip(split_archive, base)
     extract_zip(eval_archive, base / "evaluation")
@@ -223,18 +228,20 @@ def find_file(base: Path, name: str) -> Path | None:
 
 def verify_wider(root: Path) -> list[str]:
     base = root / "widerface"
-    images = base / "WIDER_val" / "images"
     errors: list[str] = []
-    count = image_count(images) if images.exists() else 0
-    if count != 3226:
-        errors.append(f"WIDER FACE: ожидалось 3226 изображений, найдено {count}")
-    if not find_file(base, "wider_face_val_bbx_gt.txt"):
-        errors.append("WIDER FACE: нет wider_face_val_bbx_gt.txt")
+    counts = {}
+    for split, expected in (("train", 12880), ("val", 3226)):
+        images = base / f"WIDER_{split}" / "images"
+        counts[split] = image_count(images) if images.exists() else 0
+        if counts[split] != expected:
+            errors.append(f"WIDER FACE {split}: ожидалось {expected} изображений, найдено {counts[split]}")
+        if not find_file(base, f"wider_face_{split}_bbx_gt.txt"):
+            errors.append(f"WIDER FACE: нет wider_face_{split}_bbx_gt.txt")
     for name in ("wider_face_val.mat", "wider_easy_val.mat", "wider_medium_val.mat", "wider_hard_val.mat"):
         if not find_file(base, name):
             errors.append(f"WIDER FACE: нет {name}")
     if not errors:
-        say(f"  OK WIDER FACE: {count} изображений")
+        say(f"  OK WIDER FACE: train {counts['train']}, val {counts['val']} изображений")
     return errors
 
 

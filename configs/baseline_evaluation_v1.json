@@ -1,0 +1,46 @@
+{
+  "config_schema_version": "baseline_evaluation_config_v1",
+  "experiment_name": "baseline_evaluation_v1",
+  "seed": 42,
+  "paths": {
+    "data_root": "/mnt/storage-1/k.ryazanov/datasets/baseline_v1",
+    "wider_train_images": "widerface/WIDER_train/images",
+    "wider_train_annotations": "widerface/wider_face_split/wider_face_train_bbx_gt.txt",
+    "wider_val_images": "widerface/WIDER_val/images",
+    "wider_val_annotations": "widerface/wider_face_split/wider_face_val_bbx_gt.txt",
+    "wider_eval_tools": "widerface/evaluation",
+    "xqlfw_images": "xqlfw/xqlfw",
+    "xqlfw_pairs": "xqlfw/xqlfw_pairs.txt",
+    "celeba_images": "celeba/img_celeba",
+    "celeba_annotations": "celeba/annotations"
+  },
+  "model": {
+    "name": "buffalo_l",
+    "provider": "cuda",
+    "device": 0,
+    "detection_size": 640,
+    "minimum_detection_score": 0.01
+  },
+  "processing": {
+    "batch_size": 64,
+    "minimum_free_gib": 20,
+    "limit": null
+  },
+  "wider": {
+    "expected_train_images": 12880,
+    "expected_val_images": 3226,
+    "iou_threshold": 0.5,
+    "confidence_thresholds": [0.01, 0.03, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95],
+    "high_precision_target": 0.99
+  },
+  "xqlfw": {
+    "far_values": [0.1, 0.01, 0.001, 0.0001]
+  },
+  "celeba": {
+    "expected_records": 202599,
+    "main_face_min_iou": 0.3,
+    "threshold_candidates": [0.35, 0.4, 0.45, 0.5, 0.55, 0.6],
+    "cluster_block_size": 2048,
+    "ann_neighbors": 64
+  }
+}

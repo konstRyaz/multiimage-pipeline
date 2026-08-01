@@ -1,8 +1,11 @@
-.PHONY: test synthetic experiment-synthetic clean-synthetic
+.PHONY: test baseline-help synthetic experiment-synthetic clean-synthetic
 
 PYTHON ?= python3
 test:
 	$(PYTHON) -m unittest discover -s tests -v
+
+baseline-help:
+	$(PYTHON) src/baseline_evaluate.py --help
 
 synthetic:
 	$(PYTHON) src/generate_synthetic.py --output-dir runs/synthetic_demo --overwrite
