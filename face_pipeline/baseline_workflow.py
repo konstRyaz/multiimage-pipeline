@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 import platform
 import shutil
 import subprocess
@@ -38,8 +39,136 @@ from .io import write_csv, write_json
 CONFIG_SCHEMA = "baseline_evaluation_config_v1"
 FROZEN_SCHEMA = "baseline_frozen_parameters_v1"
 RESULT_SCHEMA = "baseline_evaluation_result_v1"
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None or not math.isfinite(seconds):
+        return "неизвестно"
+    value = max(0, int(round(seconds)))
+    days, value = divmod(value, 86_400)
+    hours, value = divmod(value, 3_600)
+    minutes, seconds = divmod(value, 60)
+    if days:
+        return f"{days} д {hours:02d} ч {minutes:02d} мин"
+    if hours:
+        return f"{hours} ч {minutes:02d} мин"
+    if minutes:
+        return f"{minutes} мин {seconds:02d} с"
+    return f"{seconds} с"
+
+
+class ProgressReporter:
+    """Живой прогресс стадии с атомарным снимком и дописываемой историей."""
+
+    def __init__(self, run_dir: Path, stage: str, interval_seconds: float = 30.0):
+        self.run_dir = run_dir.resolve()
+        self.stage = stage
+        self.interval_seconds = max(1.0, float(interval_seconds))
+        self.progress_dir = self.run_dir / "progress"
+        self.progress_dir.mkdir(parents=True, exist_ok=True)
+        self.stage_started = time.monotonic()
+        self.phase_started = self.stage_started
+        self.last_written = 0.0
+        self.phase = "инициализация"
+        self.total = 0
+        self._write_event({"event": "stage_started", "stage": stage, "timestamp": utc_now()})
+
+    def _write_event(self, event: dict[str, Any], metrics: bool = False) -> None:
+        path = self.progress_dir / ("intermediate_metrics.jsonl" if metrics else "events.jsonl")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+
+    def begin_phase(self, phase: str, total: int) -> None:
+        self.phase = phase
+        self.total = int(total)
+        self.phase_started = time.monotonic()
+        self.last_written = 0.0
+        self._write_event({"event": "phase_started", "stage": self.stage, "phase": phase,
+                           "total": self.total, "timestamp": utc_now()})
+        self.advance(0, {"items": self.total, "cache_hits": 0, "computed": 0, "errors": 0}, force=True)
+
+    def advance(
+        self,
+        processed: int,
+        stats: dict[str, int],
+        technical_metrics: dict[str, Any] | None = None,
+        force: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_written < self.interval_seconds:
+            return
+        elapsed = max(0.0, now - self.phase_started)
+        rate = processed / elapsed if processed and elapsed > 0 else 0.0
+        remaining = max(0, self.total - processed)
+        eta = remaining / rate if rate > 0 else None
+        snapshot = {
+            "status": "running",
+            "timestamp": utc_now(),
+            "stage": self.stage,
+            "phase": self.phase,
+            "processed": int(processed),
+            "total": self.total,
+            "percent": 100.0 * processed / self.total if self.total else 100.0,
+            "phase_elapsed_seconds": round(elapsed, 3),
+            "stage_elapsed_seconds": round(now - self.stage_started, 3),
+            "rate_items_per_second": rate,
+            "eta_seconds": eta,
+            "eta_scope": "current_phase",
+            "estimated_completion": (
+                datetime.fromtimestamp(time.time() + eta, timezone.utc).isoformat() if eta is not None else None
+            ),
+            "cache": {
+                "hits": int(stats.get("cache_hits", 0)),
+                "computed": int(stats.get("computed", 0)),
+                "errors": int(stats.get("errors", 0)),
+            },
+            "technical_metrics": technical_metrics or {},
+        }
+        write_json(self.progress_dir / "current.json", snapshot)
+        self._write_event({"event": "progress", **snapshot})
+        compact_metrics = " ".join(f"{key}={value}" for key, value in (technical_metrics or {}).items())
+        print(
+            f"[{snapshot['timestamp']}] {self.stage}/{self.phase}: "
+            f"{processed}/{self.total} ({snapshot['percent']:.1f}%), "
+            f"{rate:.2f} эл/с, осталось ~{_format_duration(eta)}, "
+            f"вычислено={stats.get('computed', 0)}, кэш={stats.get('cache_hits', 0)}, "
+            f"ошибок={stats.get('errors', 0)}"
+            + (f", {compact_metrics}" if compact_metrics else ""),
+            flush=True,
+        )
+        self.last_written = now
+
+    def metric(self, component: str, values: dict[str, Any]) -> None:
+        event = {"event": "intermediate_metrics", "timestamp": utc_now(), "stage": self.stage,
+                 "component": component, "metrics": values}
+        self._write_event(event, metrics=True)
+        self._write_event(event)
+        print(f"[{event['timestamp']}] ПРОМЕЖУТОЧНЫЕ МЕТРИКИ {component}: "
+              f"{json.dumps(values, ensure_ascii=False)}", flush=True)
+
+    def complete(self, elapsed_seconds: float) -> None:
+        snapshot = {"status": "complete", "timestamp": utc_now(), "stage": self.stage,
+                    "elapsed_seconds": round(float(elapsed_seconds), 3)}
+        write_json(self.progress_dir / "current.json", snapshot)
+        self._write_event({"event": "stage_complete", **snapshot})
+        print(f"[{snapshot['timestamp']}] Стадия {self.stage} завершена за "
+              f"{_format_duration(float(elapsed_seconds))}", flush=True)
+
+
+def record_stage_failure(run_dir: Path, stage: str, error: BaseException) -> None:
+    progress_dir = run_dir.resolve() / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    snapshot = {"status": "failed", "timestamp": utc_now(), "stage": stage,
+                "error_type": type(error).__name__, "error": str(error)}
+    write_json(progress_dir / "current.json", snapshot)
+    with (progress_dir / "events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"event": "stage_failed", **snapshot}, ensure_ascii=False,
+                                separators=(",", ":")) + "\n")
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -253,10 +382,22 @@ class InsightFaceRuntime:
         return {"boxes": boxes, "embeddings": embeddings}
 
 
-def _process_cached(paths: Sequence[Path], cache: DiskCache, runtime: InsightFaceRuntime, task: str, batch_size: int) -> tuple[list[dict[str, np.ndarray] | None], dict[str, int], list[str]]:
+def _process_cached(
+    paths: Sequence[Path],
+    cache: DiskCache,
+    runtime: InsightFaceRuntime,
+    task: str,
+    batch_size: int,
+    progress: ProgressReporter | None = None,
+    phase: str = "обработка",
+    on_item: Callable[[int, dict[str, np.ndarray] | None], None] | None = None,
+    technical_metrics: Callable[[], dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, np.ndarray] | None], dict[str, int], list[str]]:
     output: list[dict[str, np.ndarray] | None] = []
     stats = {"items": len(paths), "cache_hits": 0, "computed": 0, "errors": 0}
     skipped = []
+    if progress is not None:
+        progress.begin_phase(phase, len(paths))
     for start in range(0, len(paths), batch_size):
         for path in paths[start:start + batch_size]:
             try:
@@ -267,6 +408,12 @@ def _process_cached(paths: Sequence[Path], cache: DiskCache, runtime: InsightFac
                 stats["errors"] += 1
                 skipped.append(f"{path}: {exc}")
                 output.append(None)
+            if on_item is not None:
+                on_item(len(output) - 1, output[-1])
+            if progress is not None:
+                progress.advance(len(output), stats, technical_metrics() if technical_metrics is not None else None)
+    if progress is not None:
+        progress.advance(len(output), stats, technical_metrics() if technical_metrics is not None else None, force=True)
     return output, stats, skipped
 
 
@@ -287,10 +434,16 @@ def _celeba_data(config: dict[str, Any]) -> tuple[list[CelebARecord], Path]:
     return records, images
 
 
-def prepare(config: dict[str, Any], run_dir: Path, repo_root: Path) -> dict[str, Any]:
+def prepare(
+    config: dict[str, Any],
+    run_dir: Path,
+    repo_root: Path,
+    progress_interval_seconds: float = 30.0,
+) -> dict[str, Any]:
     started = time.monotonic()
     run_dir = run_dir.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
+    progress = ProgressReporter(run_dir, "prepare", progress_interval_seconds)
     preflight_result = preflight(config, run_dir, check_model=False)
     wider_train, _ = _wider_data(config, "train")
     wider_val, _ = _wider_data(config, "val")
@@ -315,23 +468,71 @@ def prepare(config: dict[str, Any], run_dir: Path, repo_root: Path) -> dict[str,
     write_json(run_dir / "resolved_config.json", config)
     write_json(run_dir / "dataset_summary.json", summary)
     write_json(run_dir / "run_metadata.json", metadata)
-    return _save_stage(run_dir, "prepare", started, {"dataset_summary": summary})
+    progress.metric("dataset_summary", summary)
+    result = _save_stage(run_dir, "prepare", started, {"dataset_summary": summary})
+    progress.complete(float(result["elapsed_seconds"]))
+    return result
 
 
-def _wider_predictions(config: dict[str, Any], run_dir: Path, split: str, runtime: InsightFaceRuntime) -> tuple[list[WiderImage], list[np.ndarray], dict[str, int], list[str]]:
+def _wider_predictions(
+    config: dict[str, Any],
+    run_dir: Path,
+    split: str,
+    runtime: InsightFaceRuntime,
+    progress: ProgressReporter | None = None,
+) -> tuple[list[WiderImage], list[np.ndarray], dict[str, int], list[str]]:
     records, images_dir = _wider_data(config, split)
     records = list(_limit(config, records))
     cache = DiskCache(run_dir / "cache" / "wider" / split, experiment_fingerprint(config) + ":wider:detection")
-    values, stats, skipped = _process_cached([images_dir / item.relative_path for item in records], cache, runtime, "detection", int(config["processing"]["batch_size"]))
+    observed = {"processed": 0, "detections": 0, "images_with_detections": 0}
+    def on_item(_index: int, value: dict[str, np.ndarray] | None) -> None:
+        observed["processed"] += 1
+        if value is not None:
+            detections = len(value["boxes"])
+            observed["detections"] += detections
+            observed["images_with_detections"] += int(detections > 0)
+    def metrics() -> dict[str, Any]:
+        processed = observed["processed"]
+        return {"детекций": observed["detections"],
+                "изображений_с_лицом": observed["images_with_detections"],
+                "доля_с_лицом": round(observed["images_with_detections"] / processed, 6) if processed else 0.0}
+    values, stats, skipped = _process_cached(
+        [images_dir / item.relative_path for item in records], cache, runtime, "detection",
+        int(config["processing"]["batch_size"]), progress, f"wider_{split}", on_item, metrics,
+    )
     predictions = [value["boxes"] if value is not None else np.empty((0, 5), dtype=np.float32) for value in values]
     return records, predictions, stats, skipped
 
 
-def _celeba_embeddings(config: dict[str, Any], run_dir: Path, partitions: set[str], runtime: InsightFaceRuntime) -> tuple[np.ndarray, list[int], list[str], dict[str, Any], list[str]]:
+def _celeba_embeddings(
+    config: dict[str, Any],
+    run_dir: Path,
+    partitions: set[str],
+    runtime: InsightFaceRuntime,
+    progress: ProgressReporter | None = None,
+) -> tuple[np.ndarray, list[int], list[str], dict[str, Any], list[str]]:
     records, images_dir = _celeba_data(config)
     selected = list(_limit(config, [item for item in records if item.partition in partitions]))
     cache = DiskCache(run_dir / "cache" / "celeba", experiment_fingerprint(config) + ":celeba:face")
-    values, stats, skipped = _process_cached([images_dir / item.filename for item in selected], cache, runtime, "face", int(config["processing"]["batch_size"]))
+    observed = {"processed": 0, "main_face_found": 0, "faces": 0}
+    def on_item(index: int, value: dict[str, np.ndarray] | None) -> None:
+        observed["processed"] += 1
+        if value is None:
+            return
+        observed["faces"] += len(value["boxes"])
+        observed["main_face_found"] += int(match_main_face(
+            selected[index].bbox, value["boxes"], float(config["celeba"]["main_face_min_iou"])
+        ) is not None)
+    def metrics() -> dict[str, Any]:
+        processed = observed["processed"]
+        return {"найдено_главных_лиц": observed["main_face_found"],
+                "текущее_покрытие": round(observed["main_face_found"] / processed, 6) if processed else 0.0,
+                "всего_детекций": observed["faces"]}
+    phase = "celeba_" + "+".join(sorted(partitions))
+    values, stats, skipped = _process_cached(
+        [images_dir / item.filename for item in selected], cache, runtime, "face",
+        int(config["processing"]["batch_size"]), progress, phase, on_item, metrics,
+    )
     vectors, labels, names = [], [], []
     missing_main = 0
     for record, value in zip(selected, values):
@@ -363,11 +564,27 @@ def _select_celeba(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
                                       float(row["metrics"]["all_identities"]["pair_f1"]), float(row["threshold"])))
 
 
-def _xqlfw_scores(config: dict[str, Any], run_dir: Path, runtime: InsightFaceRuntime) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any], list[str]]:
+def _xqlfw_scores(
+    config: dict[str, Any],
+    run_dir: Path,
+    runtime: InsightFaceRuntime,
+    progress: ProgressReporter | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any], list[str]]:
     pairs = parse_xqlfw_pairs(_resolve(config, "xqlfw_pairs"), _resolve(config, "xqlfw_images"))
     paths = sorted({path.resolve() for pair in pairs for path in (pair.left, pair.right)}, key=str)
     cache = DiskCache(run_dir / "cache" / "xqlfw", experiment_fingerprint(config) + ":xqlfw:face")
-    values, stats, skipped = _process_cached(paths, cache, runtime, "face", int(config["processing"]["batch_size"]))
+    observed = {"processed": 0, "usable": 0}
+    def on_item(_index: int, value: dict[str, np.ndarray] | None) -> None:
+        observed["processed"] += 1
+        observed["usable"] += int(value is not None and len(value["embeddings"]) > 0)
+    def metrics() -> dict[str, Any]:
+        processed = observed["processed"]
+        return {"пригодных_изображений": observed["usable"],
+                "текущее_покрытие": round(observed["usable"] / processed, 6) if processed else 0.0}
+    values, stats, skipped = _process_cached(
+        paths, cache, runtime, "face", int(config["processing"]["batch_size"]),
+        progress, "xqlfw", on_item, metrics,
+    )
     embeddings: dict[Path, np.ndarray] = {}
     for path, value in zip(paths, values):
         if value is None or len(value["embeddings"]) == 0:
@@ -383,54 +600,75 @@ def _xqlfw_scores(config: dict[str, Any], run_dir: Path, runtime: InsightFaceRun
     return scores, labels, folds, {**stats, "usable_images": len(embeddings), "pairs": len(pairs)}, skipped
 
 
-def calibrate(config: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+def calibrate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: float = 30.0) -> dict[str, Any]:
     started = time.monotonic()
+    progress = ProgressReporter(run_dir, "calibrate", progress_interval_seconds)
     _require_stage(run_dir, "prepare")
     _ensure_run_compatible(run_dir, config)
     np.random.seed(int(config["seed"]))
     runtime = InsightFaceRuntime(config["model"])
-    wider_records, predictions, wider_cache, warnings = _wider_predictions(config, run_dir, "train", runtime)
+    wider_records, predictions, wider_cache, warnings = _wider_predictions(config, run_dir, "train", runtime, progress)
     curve = detector_curve(predictions, [np.asarray(item.boxes) for item in wider_records], config["wider"]["confidence_thresholds"], float(config["wider"]["iou_threshold"]))
     operating = select_detector_threshold(curve)
     high_precision = select_detector_threshold(curve, float(config["wider"]["high_precision_target"]))
     if operating is None:
         raise BaselineDataError("WIDER train: невозможно выбрать рабочий порог")
     write_csv(run_dir / "calibration" / "wider_threshold_curve.csv", curve)
-    vectors, labels, _, celeba_coverage, celeba_warnings = _celeba_embeddings(config, run_dir, {"train"}, runtime)
+    progress.metric("wider_train", {"operating": operating, "high_precision": high_precision,
+                                     "coverage": wider_cache})
+    vectors, labels, _, celeba_coverage, celeba_warnings = _celeba_embeddings(
+        config, run_dir, {"train"}, runtime, progress
+    )
     celeba_rows = _celeba_threshold_results(vectors, labels, config)
     write_json(run_dir / "calibration" / "celeba_train_candidates.json", celeba_rows)
-    scores, pair_labels, folds, xqlfw_cache, xqlfw_warnings = _xqlfw_scores(config, run_dir, runtime)
+    progress.metric("celeba_train", {"best_candidate": _select_celeba(celeba_rows),
+                                      "coverage": celeba_coverage})
+    scores, pair_labels, folds, xqlfw_cache, xqlfw_warnings = _xqlfw_scores(config, run_dir, runtime, progress)
     np.savez_compressed(run_dir / "calibration" / "xqlfw_scores.npz", scores=scores, labels=pair_labels, folds=folds)
+    progress.metric("xqlfw_scores", {"pairs": len(scores), "cache": xqlfw_cache,
+                                      "mean_same_similarity": float(np.mean(scores[pair_labels])),
+                                      "mean_different_similarity": float(np.mean(scores[~pair_labels]))})
     result = {"wider": {"split": "train", "operating": operating, "high_precision": high_precision, "cache": wider_cache},
               "celeba": {"split": "train", "candidates": celeba_rows, "coverage": celeba_coverage},
               "xqlfw": {"prepared_scores": len(scores), "cache": xqlfw_cache}}
     write_json(run_dir / "calibration" / "summary.json", result)
-    return _save_stage(run_dir, "calibrate", started, result, [*warnings, *celeba_warnings, *xqlfw_warnings])
+    stage = _save_stage(run_dir, "calibrate", started, result, [*warnings, *celeba_warnings, *xqlfw_warnings])
+    progress.complete(float(stage["elapsed_seconds"]))
+    return stage
 
 
-def validate(config: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+def validate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: float = 30.0) -> dict[str, Any]:
     started = time.monotonic()
+    progress = ProgressReporter(run_dir, "validate", progress_interval_seconds)
     _require_stage(run_dir, "calibrate")
     _ensure_run_compatible(run_dir, config)
     runtime = InsightFaceRuntime(config["model"])
-    vectors, labels, _, coverage, warnings = _celeba_embeddings(config, run_dir, {"val"}, runtime)
+    vectors, labels, _, coverage, warnings = _celeba_embeddings(config, run_dir, {"val"}, runtime, progress)
     candidates = _celeba_threshold_results(vectors, labels, config)
     selected = _select_celeba(candidates)
     with np.load(run_dir / "calibration" / "xqlfw_scores.npz", allow_pickle=False) as saved:
         xqlfw = xqlfw_cross_validation(saved["scores"], saved["labels"], saved["folds"], config["xqlfw"]["far_values"])
+    progress.metric("celeba_val", {"selected_configuration": selected, "coverage": coverage})
+    progress.metric("xqlfw_cross_validation", {"accuracy_mean": xqlfw["accuracy_mean"],
+                                                "accuracy_std": xqlfw["accuracy_std"],
+                                                "roc_auc": xqlfw["roc_auc"], "eer": xqlfw["eer"],
+                                                "verification_threshold": xqlfw["verification_threshold"]})
     result = {"celeba": {"split": "val", "candidates": candidates, "selected_configuration": selected, "coverage": coverage},
               "xqlfw": xqlfw}
     write_json(run_dir / "validation" / "summary.json", result)
-    return _save_stage(run_dir, "validate", started, result, [*warnings, *xqlfw.get("warnings", [])])
+    stage = _save_stage(run_dir, "validate", started, result, [*warnings, *xqlfw.get("warnings", [])])
+    progress.complete(float(stage["elapsed_seconds"]))
+    return stage
 
 
-def freeze(config: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+def freeze(config: dict[str, Any], run_dir: Path, progress_interval_seconds: float = 30.0) -> dict[str, Any]:
     started = time.monotonic()
+    progress = ProgressReporter(run_dir, "freeze", progress_interval_seconds)
     calibration = _require_stage(run_dir, "calibrate")["outputs"]
     validation = _require_stage(run_dir, "validate")["outputs"]
     _ensure_run_compatible(run_dir, config)
     runtime = InsightFaceRuntime(config["model"])
-    vectors, labels, _, coverage, warnings = _celeba_embeddings(config, run_dir, {"train", "val"}, runtime)
+    vectors, labels, _, coverage, warnings = _celeba_embeddings(config, run_dir, {"train", "val"}, runtime, progress)
     recalibrated = _select_celeba(_celeba_threshold_results(vectors, labels, config))
     frozen = {"frozen_schema_version": FROZEN_SCHEMA, "created_at": utc_now(),
               "experiment_name": config["experiment_name"], "experiment_fingerprint": experiment_fingerprint(config),
@@ -445,7 +683,11 @@ def freeze(config: dict[str, Any], run_dir: Path) -> dict[str, Any]:
               "model": config["model"], "recalibration_coverage": coverage}
     validate_frozen(frozen, config)
     write_json(run_dir / "frozen_parameters.json", frozen)
-    return _save_stage(run_dir, "freeze", started, {"frozen_parameters": frozen}, warnings)
+    progress.metric("frozen_parameters", {"wider": frozen["wider"], "xqlfw": frozen["xqlfw"],
+                                           "celeba": frozen["celeba"], "coverage": coverage})
+    stage = _save_stage(run_dir, "freeze", started, {"frozen_parameters": frozen}, warnings)
+    progress.complete(float(stage["elapsed_seconds"]))
+    return stage
 
 
 def validate_frozen(frozen: dict[str, Any], config: dict[str, Any]) -> None:
@@ -460,9 +702,15 @@ def validate_frozen(frozen: dict[str, Any], config: dict[str, Any]) -> None:
         raise BaselineDataError("В замороженных параметрах отсутствуют обязательные поля: " + ", ".join(missing))
 
 
-def evaluate(config: dict[str, Any], run_dir: Path, frozen_path: Path) -> dict[str, Any]:
+def evaluate(
+    config: dict[str, Any],
+    run_dir: Path,
+    frozen_path: Path,
+    progress_interval_seconds: float = 30.0,
+) -> dict[str, Any]:
     """Итоговая оценка. Эта функция принципиально не вызывает подбор порогов."""
     started = time.monotonic()
+    progress = ProgressReporter(run_dir, "evaluate", progress_interval_seconds)
     _require_stage(run_dir, "prepare")
     _ensure_run_compatible(run_dir, config)
     if not frozen_path.is_file():
@@ -470,7 +718,7 @@ def evaluate(config: dict[str, Any], run_dir: Path, frozen_path: Path) -> dict[s
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
     validate_frozen(frozen, config)
     runtime = InsightFaceRuntime(config["model"])
-    wider_records, predictions, wider_cache, warnings = _wider_predictions(config, run_dir, "val", runtime)
+    wider_records, predictions, wider_cache, warnings = _wider_predictions(config, run_dir, "val", runtime, progress)
     threshold = float(frozen["wider"]["confidence_threshold"])
     curve_at_frozen = detector_curve(predictions, [np.asarray(item.boxes) for item in wider_records], [threshold], float(frozen["wider"]["iou_threshold"]))[0]
     eval_dir = _resolve(config, "wider_eval_tools")
@@ -485,15 +733,26 @@ def evaluate(config: dict[str, Any], run_dir: Path, frozen_path: Path) -> dict[s
         ap[subset] = wider_compatible_ap([item.relative_path for item in wider_records], predictions,
                                          [np.asarray(item.boxes) for item in wider_records], keep,
                                          float(frozen["wider"]["iou_threshold"]))
-    vectors, labels, _, celeba_coverage, celeba_warnings = _celeba_embeddings(config, run_dir, {"test"}, runtime)
+    progress.metric("wider_val", {"ap_easy": ap["easy"], "ap_medium": ap["medium"],
+                                   "ap_hard": ap["hard"], "operating_point": curve_at_frozen,
+                                   "coverage": wider_cache})
+    vectors, labels, _, celeba_coverage, celeba_warnings = _celeba_embeddings(
+        config, run_dir, {"test"}, runtime, progress
+    )
     predicted = scalable_threshold_clusters(vectors, float(frozen["celeba"]["clustering_threshold"]),
                                             int(config["celeba"]["cluster_block_size"]), int(frozen["celeba"]["ann_neighbors"]), int(config["seed"]))
     celeba_metrics = metrics_all_and_multi(labels, predicted.tolist())
-    scores, pair_labels, _, xqlfw_cache, xqlfw_warnings = _xqlfw_scores(config, run_dir, runtime)
+    progress.metric("celeba_test", {"metrics": celeba_metrics, "coverage": celeba_coverage,
+                                     "predicted_clusters": int(len(np.unique(predicted)))})
+    scores, pair_labels, _, xqlfw_cache, xqlfw_warnings = _xqlfw_scores(config, run_dir, runtime, progress)
     verification_threshold = float(frozen["xqlfw"]["verification_threshold"])
     xqlfw_metrics = {"frozen_threshold": verification_threshold,
                      "classification": precision_recall_f1(pair_labels, scores >= verification_threshold),
                      **verification_metrics(scores, pair_labels, config["xqlfw"]["far_values"])}
+    progress.metric("xqlfw_frozen", {"frozen_threshold": verification_threshold,
+                                      "classification": xqlfw_metrics["classification"],
+                                      "roc_auc": xqlfw_metrics["roc_auc"], "eer": xqlfw_metrics["eer"],
+                                      "tar_at_far": xqlfw_metrics["tar_at_far"]})
     result = {"result_schema_version": RESULT_SCHEMA,
               "wider": {"split": "val", "ap_protocol": "strictly compatible with official widerface_evaluate 1000-point protocol",
                         "ap_easy": ap["easy"], "ap_medium": ap["medium"], "ap_hard": ap["hard"],
@@ -512,4 +771,6 @@ def evaluate(config: dict[str, Any], run_dir: Path, frozen_path: Path) -> dict[s
               f"CelebA test B-cubed F1={float(celeba_metrics['all_identities']['bcubed_f1']):.6f}", "",
               "Подробные значения находятся в metrics.json."]
     (run_dir / "evaluation" / "REPORT.md").write_text("\n".join(report) + "\n", encoding="utf-8")
-    return _save_stage(run_dir, "evaluate", started, result, all_warnings)
+    stage = _save_stage(run_dir, "evaluate", started, result, all_warnings)
+    progress.complete(float(stage["elapsed_seconds"]))
+    return stage

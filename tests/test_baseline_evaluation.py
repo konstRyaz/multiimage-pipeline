@@ -27,6 +27,7 @@ from face_pipeline.baseline_workflow import (
     CONFIG_SCHEMA,
     FROZEN_SCHEMA,
     DiskCache,
+    ProgressReporter,
     evaluate,
     experiment_fingerprint,
     validate_frozen,
@@ -186,6 +187,27 @@ class FreezeAndCacheTests(unittest.TestCase):
             self.assertTrue(second_hit)
             self.assertEqual(calls, [1])
             np.testing.assert_array_equal(first["boxes"], second["boxes"])
+
+
+class ProgressReporterTests(unittest.TestCase):
+    def test_writes_atomic_snapshot_history_and_intermediate_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reporter = ProgressReporter(root, "calibrate", interval_seconds=1)
+            reporter.begin_phase("celeba_train", 10)
+            reporter.advance(4, {"items": 10, "cache_hits": 1, "computed": 3, "errors": 0},
+                             {"текущее_покрытие": 0.75}, force=True)
+            reporter.metric("fixture", {"f1": 0.8})
+            current = json.loads((root / "progress" / "current.json").read_text(encoding="utf-8"))
+            self.assertEqual(current["stage"], "calibrate")
+            self.assertEqual(current["phase"], "celeba_train")
+            self.assertEqual(current["processed"], 4)
+            self.assertAlmostEqual(current["percent"], 40.0)
+            self.assertIn("eta_seconds", current)
+            self.assertEqual(current["technical_metrics"]["текущее_покрытие"], 0.75)
+            metric = json.loads((root / "progress" / "intermediate_metrics.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(metric["component"], "fixture")
+            self.assertEqual(metric["metrics"]["f1"], 0.8)
 
 
 if __name__ == "__main__":

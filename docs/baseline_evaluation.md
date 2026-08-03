@@ -50,6 +50,99 @@ python src/baseline_evaluate.py evaluate  --config "$CONFIG" --run-dir "$RUN" \
   --frozen "$RUN/frozen_parameters.json"
 ```
 
+Для долгого запуска на одной GPU рекомендуется один сеанс `tmux` и единый
+журнал оболочки. Параметр `--progress-interval` не входит в отпечаток
+эксперимента и не влияет на кэш или метрики:
+
+```bash
+scripts/run_baseline_full_1gpu.sh \
+  --run-dir /mnt/storage-1/k.ryazanov/runs/baseline_evaluation_full_1gpu_v1 \
+  --gpu 3 \
+  --progress-interval 30
+```
+
+Сценарий выполняет предварительную проверку, затем все пять стадий. При
+повторном запуске он пропускает стадии с корректным состоянием `complete` и
+продолжает незавершённую стадию через поэлементный кэш. Индекс `--gpu` задаёт
+физическую карту; внутри ограниченного `CUDA_VISIBLE_DEVICES` конфигурация
+продолжает корректно использовать `model.device=0`.
+
+Эквивалентная последовательность команд сценария:
+
+```bash
+CONFIG=configs/baseline_evaluation_v1.json
+RUN=/mnt/storage-1/k.ryazanov/runs/baseline_evaluation_full_1gpu_v1
+PROGRESS_INTERVAL=30
+
+set -o pipefail
+mkdir -p "$RUN"
+
+run_stage() {
+  stage="$1"
+  shift
+  echo "=== $(date --iso-8601=seconds) START $stage ===" | tee -a "$RUN/full_run.log"
+  python src/baseline_evaluate.py "$stage" \
+    --config "$CONFIG" --run-dir "$RUN" \
+    --progress-interval "$PROGRESS_INTERVAL" "$@" \
+    2>&1 | tee -a "$RUN/full_run.log"
+  status=${PIPESTATUS[0]}
+  echo "=== $(date --iso-8601=seconds) END $stage status=$status ===" | tee -a "$RUN/full_run.log"
+  return "$status"
+}
+
+python src/baseline_evaluate.py preflight --config "$CONFIG" --run-dir "$RUN" &&
+run_stage prepare &&
+run_stage calibrate &&
+run_stage validate &&
+run_stage freeze &&
+run_stage evaluate --frozen "$RUN/frozen_parameters.json"
+```
+
+Цепочка на `&&` принципиальна: следующая стадия не начнётся после ошибки.
+Повторный запуск той же стадии безопасно использует корректные файлы кэша.
+
+## Живой прогресс, ETA и промежуточные метрики
+
+Во время обработки каждые 30 секунд в терминал и `full_run.log` выводятся:
+
+- текущая стадия и часть датасета;
+- обработанное и полное число элементов, процент;
+- средняя скорость с начала текущей части;
+- динамическая оценка оставшегося времени;
+- число новых вычислений, попаданий в кэш и ошибок;
+- техническое покрытие: наличие детекций, главного лица CelebA или пригодного
+  эмбеддинга XQLFW.
+
+В другом SSH-окне состояние можно смотреть без подключения к `tmux`:
+
+```bash
+cd /home/k.ryazanov/multiimage-pipeline
+source .venv/bin/activate
+RUN=/mnt/storage-1/k.ryazanov/runs/baseline_evaluation_full_1gpu_v1
+
+watch -n 15 "python src/baseline_evaluate.py status --run-dir '$RUN' --metrics 3"
+```
+
+Для непрерывного текстового журнала:
+
+```bash
+tail -F "$RUN/full_run.log"
+```
+
+Файлы наблюдения:
+
+```text
+RUN/progress/current.json                 # последний атомарный снимок и ETA
+RUN/progress/events.jsonl                 # полная хронология прогресса
+RUN/progress/intermediate_metrics.jsonl   # содержательные контрольные метрики
+```
+
+Промежуточные содержательные показатели записываются сразу после готовности
+каждого блока: WIDER train, CelebA train, XQLFW scores, CelebA val,
+десятиблочная проверка XQLFW, замороженные параметры и три итоговых блока.
+Техническое покрытие на незавершённой части не является оценкой качества на
+полном датасете. Итоговыми считаются только значения завершённой стадии.
+
 `evaluate` требует явный `--frozen`. Она проверяет версию схемы, отпечаток
 эксперимента и наличие отдельных порогов детекции WIDER FACE, верификации
 XQLFW и кластеризации CelebA. В этой функции нет вызовов подбора порога.
@@ -133,6 +226,10 @@ RUN/
 │   ├── freeze.json
 │   └── evaluate.json
 ├── cache/{wider,xqlfw,celeba}/
+├── progress/
+│   ├── current.json
+│   ├── events.jsonl
+│   └── intermediate_metrics.jsonl
 ├── calibration/
 ├── validation/summary.json
 └── evaluation/
