@@ -58,6 +58,29 @@ class WiderParserTests(unittest.TestCase):
             self.assertEqual([item.relative_path for item in records], ["0--Parade/a.jpg", "b.jpg"])
             self.assertEqual(records[0].boxes, ((1.0, 2.0, 4.0, 6.0),))
 
+    def test_parser_skips_official_placeholder_after_zero_boxes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gt.txt"
+            path.write_text(
+                "zero.jpg\n"
+                "0\n"
+                "0 0 0 0 0 0 0 0 0 0\n"
+                "next.jpg\n"
+                "1\n"
+                "1 2 3 4 0 0 0 0 0 0\n",
+                encoding="utf-8",
+            )
+            records = parse_wider_annotations(path)
+            self.assertEqual(
+                [item.relative_path for item in records],
+                ["zero.jpg", "next.jpg"],
+            )
+            self.assertEqual(records[0].boxes, ())
+            self.assertEqual(
+                records[1].boxes,
+                ((1.0, 2.0, 4.0, 6.0),),
+            )
+
     def test_detector_curve_and_compatible_ap_on_perfect_fixture(self) -> None:
         predictions = [np.asarray([[20, 20, 30, 30, 0.1], [0, 0, 9, 9, 0.9]], dtype=float)]
         actual = [np.asarray([[0, 0, 9, 9]], dtype=float)]
@@ -115,6 +138,53 @@ class CelebATests(unittest.TestCase):
             records = load_celeba_records(root, expected=3)
             self.assertEqual([(item.filename, item.identity, item.partition) for item in records], [("a.jpg", 1, "train"), ("b.jpg", 2, "val"), ("c.jpg", 3, "test")])
             self.assertEqual(records[0].bbox, (1.0, 2.0, 4.0, 6.0))
+
+    def test_preserves_zero_sized_official_bbox_as_unusable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "identity_CelebA.txt").write_text(
+                "zero.jpg 1\n",
+                encoding="utf-8",
+            )
+            (root / "list_eval_partition.txt").write_text(
+                "zero.jpg 0\n",
+                encoding="utf-8",
+            )
+            (root / "list_bbox_celeba.txt").write_text(
+                "1\n"
+                "image_id x_1 y_1 width height\n"
+                "zero.jpg 320 828 0 0\n",
+                encoding="utf-8",
+            )
+
+            records = load_celeba_records(root, expected=1)
+
+            self.assertEqual(len(records), 1)
+            self.assertIsNone(records[0].bbox)
+
+    def test_rejects_partially_degenerate_official_bbox(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "identity_CelebA.txt").write_text(
+                "bad.jpg 1\n",
+                encoding="utf-8",
+            )
+            (root / "list_eval_partition.txt").write_text(
+                "bad.jpg 0\n",
+                encoding="utf-8",
+            )
+            (root / "list_bbox_celeba.txt").write_text(
+                "1\n"
+                "image_id x_1 y_1 width height\n"
+                "bad.jpg 10 20 0 30\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                BaselineDataError,
+                "неположительная рамка",
+            ):
+                load_celeba_records(root, expected=1)
 
     def test_rejects_identity_overlap(self) -> None:
         records = [CelebARecord("a", 1, "train", (0, 0, 1, 1)), CelebARecord("b", 1, "test", (0, 0, 1, 1))]

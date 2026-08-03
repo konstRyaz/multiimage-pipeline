@@ -513,29 +513,60 @@ def _celeba_embeddings(
 ) -> tuple[np.ndarray, list[int], list[str], dict[str, Any], list[str]]:
     records, images_dir = _celeba_data(config)
     selected = list(_limit(config, [item for item in records if item.partition in partitions]))
+    unusable_bbox = [item for item in selected if item.bbox is None]
+    eligible = [item for item in selected if item.bbox is not None]
     cache = DiskCache(run_dir / "cache" / "celeba", experiment_fingerprint(config) + ":celeba:face")
     observed = {"processed": 0, "main_face_found": 0, "faces": 0}
+
     def on_item(index: int, value: dict[str, np.ndarray] | None) -> None:
         observed["processed"] += 1
         if value is None:
             return
         observed["faces"] += len(value["boxes"])
-        observed["main_face_found"] += int(match_main_face(
-            selected[index].bbox, value["boxes"], float(config["celeba"]["main_face_min_iou"])
-        ) is not None)
+        observed["main_face_found"] += int(
+            match_main_face(
+                eligible[index].bbox,
+                value["boxes"],
+                float(config["celeba"]["main_face_min_iou"]),
+            )
+            is not None
+        )
+
     def metrics() -> dict[str, Any]:
         processed = observed["processed"]
-        return {"найдено_главных_лиц": observed["main_face_found"],
-                "текущее_покрытие": round(observed["main_face_found"] / processed, 6) if processed else 0.0,
-                "всего_детекций": observed["faces"]}
+        return {
+            "найдено_главных_лиц": observed["main_face_found"],
+            "текущее_покрытие": (
+                round(observed["main_face_found"] / processed, 6)
+                if processed
+                else 0.0
+            ),
+            "всего_детекций": observed["faces"],
+        }
+
     phase = "celeba_" + "+".join(sorted(partitions))
     values, stats, skipped = _process_cached(
-        [images_dir / item.filename for item in selected], cache, runtime, "face",
-        int(config["processing"]["batch_size"]), progress, phase, on_item, metrics,
+        [images_dir / item.filename for item in eligible],
+        cache,
+        runtime,
+        "face",
+        int(config["processing"]["batch_size"]),
+        progress,
+        phase,
+        on_item,
+        metrics,
     )
+    skipped = [
+        *[
+            f"{item.filename}: официальная рамка CelebA вырождена; "
+            "изображение исключено из сопоставления главного лица"
+            for item in unusable_bbox
+        ],
+        *skipped,
+    ]
     vectors, labels, names = [], [], []
     missing_main = 0
-    for record, value in zip(selected, values):
+    for record, value in zip(eligible, values):
         if value is None:
             continue
         match = match_main_face(record.bbox, value["boxes"], float(config["celeba"]["main_face_min_iou"]))
@@ -546,9 +577,16 @@ def _celeba_embeddings(
         labels.append(record.identity)
         names.append(record.filename)
     matrix = np.asarray(vectors, dtype=np.float32).reshape(len(vectors), -1) if vectors else np.empty((0, 512), dtype=np.float32)
-    coverage = {**stats, "selected_images": len(selected), "main_face_not_found": missing_main,
-                "clustered_images": len(vectors), "detector_coverage": (len(selected) - missing_main) / len(selected) if selected else 0.0,
-                "clustering_coverage": len(vectors) / len(selected) if selected else 0.0}
+    coverage = {
+        **stats,
+        "selected_images": len(selected),
+        "eligible_official_bbox_images": len(eligible),
+        "official_bbox_unusable": len(unusable_bbox),
+        "main_face_not_found": missing_main,
+        "clustered_images": len(vectors),
+        "detector_coverage": len(vectors) / len(eligible) if eligible else 0.0,
+        "clustering_coverage": len(vectors) / len(selected) if selected else 0.0,
+    }
     return matrix, labels, names, coverage, skipped
 
 

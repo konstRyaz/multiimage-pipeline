@@ -5,7 +5,10 @@ from typing import Sequence
 
 import numpy as np
 
-_trapz = getattr(np, "trapezoid", np.trapz)
+try:
+    _trapz = np.trapezoid
+except AttributeError:
+    _trapz = np.trapz
 
 
 def binary_counts(labels: np.ndarray, predicted: np.ndarray) -> tuple[int, int, int, int]:

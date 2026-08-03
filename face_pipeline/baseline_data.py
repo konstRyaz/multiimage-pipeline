@@ -28,13 +28,18 @@ class CelebARecord:
     filename: str
     identity: int
     partition: str
-    bbox: tuple[float, float, float, float]
+    bbox: tuple[float, float, float, float] | None
 
 
 def _nonempty(path: Path) -> list[str]:
     if not path.is_file():
         raise BaselineDataError(f"Файл разметки не найден: {path}")
     return [line.strip() for line in path.read_text(encoding="utf-8", errors="replace").splitlines() if line.strip()]
+
+
+def _is_wider_zero_placeholder(raw: str) -> bool:
+    values = raw.split()
+    return len(values) == 10 and all(value == "0" for value in values)
 
 
 def parse_wider_annotations(path: Path) -> list[WiderImage]:
@@ -51,6 +56,12 @@ def parse_wider_annotations(path: Path) -> list[WiderImage]:
         except ValueError as exc:
             raise BaselineDataError(f"WIDER FACE: некорректное число рамок для {relative}") from exc
         position += 1
+        if (
+            count == 0
+            and position < len(lines)
+            and _is_wider_zero_placeholder(lines[position])
+        ):
+            position += 1
         boxes: list[tuple[float, float, float, float]] = []
         if position + count > len(lines):
             raise BaselineDataError(f"WIDER FACE: для {relative} не хватает строк рамок")
@@ -139,18 +150,23 @@ def _parse_two_columns(path: Path, expected: int | None = None) -> dict[str, int
     return result
 
 
-def _parse_celeba_boxes(path: Path) -> dict[str, tuple[float, float, float, float]]:
+def _parse_celeba_boxes(
+    path: Path,
+) -> dict[str, tuple[float, float, float, float] | None]:
     lines = _nonempty(path)
     if lines and len(lines[0].split()) == 1:
         lines.pop(0)
     if lines and lines[0].lower().startswith("image_id"):
         lines.pop(0)
-    result: dict[str, tuple[float, float, float, float]] = {}
+    result: dict[str, tuple[float, float, float, float] | None] = {}
     for line in lines:
         values = line.split()
         if len(values) != 5:
             raise BaselineDataError(f"{path.name}: некорректная строка: {line}")
         x, y, width, height = map(float, values[1:])
+        if width == 0 and height == 0:
+            result[values[0]] = None
+            continue
         if width <= 0 or height <= 0:
             raise BaselineDataError(f"{path.name}: неположительная рамка у {values[0]}")
         result[values[0]] = (x, y, x + width, y + height)
