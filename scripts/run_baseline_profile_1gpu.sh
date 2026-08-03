@@ -3,17 +3,22 @@ set -Eeuo pipefail
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 CONFIG="$REPO_DIR/configs/baseline_evaluation_v1.json"
+PROFILE=""
 RUN_DIR=""
 GPU=""
 PROGRESS_INTERVAL=30
 PYTHON_BIN=${PYTHON_BIN:-python}
 
 usage() {
-  echo "Использование: $0 --run-dir PATH --gpu INDEX [--config PATH] [--progress-interval SECONDS]"
+  echo "Использование: $0 --profile smoke|dev-a|dev-b|full --run-dir PATH --gpu INDEX [--config PATH] [--progress-interval SECONDS]"
 }
 
 while (($#)); do
   case "$1" in
+    --profile)
+      PROFILE="$2"
+      shift 2
+      ;;
     --config)
       CONFIG="$2"
       shift 2
@@ -42,6 +47,14 @@ while (($#)); do
   esac
 done
 
+case "$PROFILE" in
+  smoke|dev-a|dev-b|full) ;;
+  *)
+    echo "Требуется --profile smoke|dev-a|dev-b|full" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
 if [[ -z "$RUN_DIR" || -z "$GPU" ]]; then
   usage >&2
   exit 2
@@ -58,7 +71,7 @@ fi
 mkdir -p "$RUN_DIR"
 RUN_DIR=$(cd "$RUN_DIR" && pwd)
 CONFIG=$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")
-LOG="$RUN_DIR/full_run.log"
+LOG="$RUN_DIR/${PROFILE}_run.log"
 export CUDA_VISIBLE_DEVICES="$GPU"
 
 stage_complete() {
@@ -77,24 +90,25 @@ PY
 }
 
 ensure_run_compatible() {
-  "$PYTHON_BIN" - "$REPO_DIR" "$CONFIG" "$RUN_DIR/run_metadata.json" <<'PY'
+  "$PYTHON_BIN" - "$REPO_DIR" "$CONFIG" "$RUN_DIR/run_metadata.json" "$PROFILE" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-repo = Path(sys.argv[1])
-config_path = Path(sys.argv[2])
-metadata_path = Path(sys.argv[3])
+repo, config_path, metadata_path, profile = map(Path, sys.argv[1:])
 sys.path.insert(0, str(repo))
 from face_pipeline.baseline_workflow import experiment_fingerprint, load_config
+from face_pipeline.celeba_profiles import apply_profile
 
 if not metadata_path.is_file():
     raise SystemExit(0)
 config = load_config(config_path)
+apply_profile(config, str(profile))
 metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 if metadata.get("experiment_fingerprint") != experiment_fingerprint(config):
     print(
-        "Каталог запуска несовместим с полной конфигурацией; используйте отдельный новый --run-dir.",
+        "Каталог запуска несовместим с выбранным профилем или конфигурацией; "
+        "используйте отдельный новый --run-dir.",
         file=sys.stderr,
     )
     raise SystemExit(2)
@@ -108,10 +122,10 @@ run_stage() {
     echo "=== $(date --iso-8601=seconds) SKIP $stage: стадия уже завершена ===" | tee -a "$LOG"
     return 0
   fi
-  echo "=== $(date --iso-8601=seconds) START $stage ===" | tee -a "$LOG"
+  echo "=== $(date --iso-8601=seconds) START $stage profile=$PROFILE ===" | tee -a "$LOG"
   set +e
   "$PYTHON_BIN" "$REPO_DIR/src/baseline_evaluate.py" "$stage" \
-    --config "$CONFIG" --run-dir "$RUN_DIR" \
+    --config "$CONFIG" --run-dir "$RUN_DIR" --profile "$PROFILE" \
     --progress-interval "$PROGRESS_INTERVAL" "$@" \
     2>&1 | tee -a "$LOG"
   local status=${PIPESTATUS[0]}
@@ -120,15 +134,19 @@ run_stage() {
   return "$status"
 }
 
-echo "=== $(date --iso-8601=seconds) START preflight GPU=$GPU ===" | tee -a "$LOG"
+echo "=== $(date --iso-8601=seconds) START preflight profile=$PROFILE physical_GPU=$GPU logical_device=0 ===" | tee -a "$LOG"
 "$PYTHON_BIN" "$REPO_DIR/src/baseline_evaluate.py" preflight \
-  --config "$CONFIG" --run-dir "$RUN_DIR" 2>&1 | tee -a "$LOG"
+  --config "$CONFIG" --run-dir "$RUN_DIR" --profile "$PROFILE" 2>&1 | tee -a "$LOG"
 ensure_run_compatible
 
 run_stage prepare
 run_stage calibrate
 run_stage validate
-run_stage freeze
-run_stage evaluate --frozen "$RUN_DIR/frozen_parameters.json"
 
-echo "=== $(date --iso-8601=seconds) ПОЛНЫЙ ПРОГОН ЗАВЕРШЁН ===" | tee -a "$LOG"
+if [[ "$PROFILE" == "full" ]]; then
+  run_stage freeze
+  run_stage evaluate --frozen "$RUN_DIR/frozen_parameters.json"
+  echo "=== $(date --iso-8601=seconds) ПОЛНЫЙ ПРОГОН ЗАВЕРШЁН ===" | tee -a "$LOG"
+else
+  echo "=== $(date --iso-8601=seconds) ИССЛЕДОВАТЕЛЬСКИЙ ПРОГОН ЗАВЕРШЁН ПОСЛЕ validate; CelebA test НЕ ИСПОЛЬЗОВАН ===" | tee -a "$LOG"
+fi

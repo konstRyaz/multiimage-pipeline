@@ -173,7 +173,12 @@ def _parse_celeba_boxes(
     return result
 
 
-def load_celeba_records(annotations_dir: Path, images_dir: Path | None = None, expected: int = 202599) -> list[CelebARecord]:
+def load_celeba_records(
+    annotations_dir: Path,
+    images_dir: Path | None = None,
+    expected: int = 202599,
+    allowed_partitions: set[str] | None = None,
+) -> list[CelebARecord]:
     identities = _parse_two_columns(annotations_dir / "identity_CelebA.txt", expected)
     partitions = _parse_two_columns(annotations_dir / "list_eval_partition.txt", expected)
     boxes = _parse_celeba_boxes(annotations_dir / "list_bbox_celeba.txt")
@@ -185,11 +190,20 @@ def load_celeba_records(annotations_dir: Path, images_dir: Path | None = None, e
     invalid = sorted({value for value in partitions.values() if value not in PARTITION_NAMES})
     if invalid:
         raise BaselineDataError(f"CelebA: неизвестные номера частей: {invalid}")
+    selected_names = sorted(
+        name
+        for name in names
+        if allowed_partitions is None
+        or PARTITION_NAMES[partitions[name]] in allowed_partitions
+    )
     if images_dir is not None:
-        missing = [name for name in sorted(names) if not (images_dir / name).is_file()]
+        missing = [name for name in selected_names if not (images_dir / name).is_file()]
         if missing:
             raise BaselineDataError(f"CelebA: отсутствуют {len(missing)} изображений, первые: {', '.join(missing[:5])}")
-    records = [CelebARecord(name, identities[name], PARTITION_NAMES[partitions[name]], boxes[name]) for name in sorted(names)]
+    records = [
+        CelebARecord(name, identities[name], PARTITION_NAMES[partitions[name]], boxes[name])
+        for name in selected_names
+    ]
     validate_identity_disjoint(records)
     return records
 
@@ -203,4 +217,3 @@ def validate_identity_disjoint(records: Iterable[CelebARecord]) -> None:
         if overlap:
             sample = ", ".join(map(str, sorted(overlap)[:10]))
             raise BaselineDataError(f"CelebA: личности пересекаются между {left} и {right}: {sample}")
-

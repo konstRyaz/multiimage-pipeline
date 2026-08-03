@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from face_pipeline.baseline_data import BaselineDataError
+from face_pipeline.celeba_profiles import ALL_PROFILES, RESEARCH_PROFILES, apply_profile
 from face_pipeline.baseline_workflow import (
     calibrate,
     evaluate,
@@ -28,6 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
         child = subparsers.add_parser(stage)
         child.add_argument("--config", type=Path, required=True)
         child.add_argument("--run-dir", type=Path, required=True)
+        child.add_argument(
+            "--profile",
+            choices=ALL_PROFILES,
+            default="full",
+            help="Профиль оценки CelebA; WIDER FACE и XQLFW всегда полные",
+        )
         child.add_argument("--limit", type=int, help="Быстрая проверка: не более N элементов каждой части")
         if stage != "preflight":
             child.add_argument("--progress-interval", type=float, default=30.0, metavar="SECONDS",
@@ -83,9 +90,15 @@ def main() -> None:
     run_dir = args.run_dir.expanduser().resolve()
     try:
         config = load_config(args.config.expanduser().resolve())
+        apply_profile(config, args.profile)
         if args.limit is not None:
             if args.limit < 1:
                 raise BaselineDataError("--limit должен быть положительным")
+            if args.profile in RESEARCH_PROFILES:
+                raise BaselineDataError(
+                    "--limit несовместим с исследовательскими профилями: "
+                    "их состав фиксируется манифестами, а WIDER FACE и XQLFW должны быть полными"
+                )
             config["processing"]["limit"] = args.limit
         repo_root = Path(__file__).resolve().parents[1]
         if args.stage == "preflight":

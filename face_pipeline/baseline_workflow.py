@@ -33,12 +33,21 @@ from .baseline_metrics import (
     xqlfw_cross_validation,
 )
 from .baseline_wider import detector_curve, load_wider_subset, select_detector_threshold, wider_compatible_ap
+from .celeba_profiles import (
+    MANIFEST_SCHEMA,
+    RESEARCH_PROFILES,
+    ensure_research_manifests,
+    is_research_profile,
+    profile_name,
+    records_from_manifest,
+)
 from .io import write_csv, write_json
 
 
 CONFIG_SCHEMA = "baseline_evaluation_config_v1"
 FROZEN_SCHEMA = "baseline_frozen_parameters_v1"
 RESULT_SCHEMA = "baseline_evaluation_result_v1"
+CELEBA_CACHE_SCHEMA = "celeba_selected_main_face_cache_v2"
 
 
 def utc_now() -> str:
@@ -206,6 +215,8 @@ def _canonical(value: Any) -> str:
 
 def experiment_fingerprint(config: dict[str, Any]) -> str:
     relevant = {key: config[key] for key in ("config_schema_version", "experiment_name", "seed", "model", "processing", "wider", "xqlfw", "celeba")}
+    if "evaluation_profile" in config:
+        relevant["evaluation_profile"] = config["evaluation_profile"]
     return hashlib.sha256(_canonical(relevant).encode("utf-8")).hexdigest()
 
 
@@ -381,6 +392,65 @@ class InsightFaceRuntime:
             embeddings = np.asarray(rows, dtype=np.float32).reshape(len(rows), -1) if rows else np.empty((0, 512), dtype=np.float32)
         return {"boxes": boxes, "embeddings": embeddings}
 
+    def infer_celeba(
+        self,
+        image_path: Path,
+        official_bbox: Sequence[float],
+        main_face_min_iou: float,
+        detector_threshold: float,
+    ) -> dict[str, np.ndarray]:
+        """Детектирует все лица, но распознаёт только выбранное главное лицо."""
+        try:
+            import cv2
+            from insightface.app.common import Face
+        except ImportError as exc:
+            raise RuntimeError(
+                "Для чтения изображений и извлечения признаков нужны OpenCV и InsightFace"
+            ) from exc
+        image = cv2.imread(str(image_path))
+        if image is None:
+            raise OSError(f"Не удалось прочитать изображение: {image_path}")
+        app = self._app("face")
+        raw_boxes, raw_keypoints = app.det_model.detect(image, max_num=0, metric="default")
+        raw_boxes = np.asarray(raw_boxes, dtype=np.float32).reshape(-1, 5)
+        detector_candidates = len(raw_boxes)
+        keep = raw_boxes[:, 4] >= float(detector_threshold) if len(raw_boxes) else np.zeros(0, dtype=bool)
+        boxes = raw_boxes[keep]
+        keypoints = None if raw_keypoints is None else np.asarray(raw_keypoints, dtype=np.float32)[keep]
+        match = match_main_face(official_bbox, boxes, main_face_min_iou)
+        if match is None:
+            return {
+                "boxes": boxes,
+                "selected_box": np.empty((0, 5), dtype=np.float32),
+                "embeddings": np.empty((0, 512), dtype=np.float32),
+                "detector_candidates": np.asarray(detector_candidates, dtype=np.int64),
+                "main_face_selected": np.asarray(0, dtype=np.int64),
+            }
+        if keypoints is None or len(keypoints) <= match:
+            raise RuntimeError(
+                "Детектор выбрал главное лицо CelebA, но не вернул ключевые точки для выравнивания"
+            )
+        selected_box = boxes[match]
+        face = Face(
+            bbox=selected_box[:4],
+            kps=keypoints[match],
+            det_score=float(selected_box[4]),
+        )
+        app.models["recognition"].get(image, face)
+        vector = np.asarray(getattr(face, "normed_embedding", None), dtype=np.float32)
+        if vector.ndim != 1 or not vector.size or not np.isfinite(vector).all():
+            raise RuntimeError("Распознаватель не вернул корректный эмбеддинг главного лица CelebA")
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-12:
+            raise RuntimeError("Распознаватель вернул нулевой эмбеддинг главного лица CelebA")
+        return {
+            "boxes": boxes,
+            "selected_box": selected_box.reshape(1, 5),
+            "embeddings": (vector / norm).reshape(1, -1),
+            "detector_candidates": np.asarray(detector_candidates, dtype=np.int64),
+            "main_face_selected": np.asarray(1, dtype=np.int64),
+        }
+
 
 def _process_cached(
     paths: Sequence[Path],
@@ -428,9 +498,16 @@ def _wider_data(config: dict[str, Any], split: str) -> tuple[list[WiderImage], P
     return records, images
 
 
-def _celeba_data(config: dict[str, Any]) -> tuple[list[CelebARecord], Path]:
+def _celeba_data(
+    config: dict[str, Any], allowed_partitions: set[str] | None = None
+) -> tuple[list[CelebARecord], Path]:
     images = _resolve(config, "celeba_images")
-    records = load_celeba_records(_resolve(config, "celeba_annotations"), images, int(config["celeba"].get("expected_records", 202599)))
+    records = load_celeba_records(
+        _resolve(config, "celeba_annotations"),
+        images,
+        int(config["celeba"].get("expected_records", 202599)),
+        allowed_partitions=allowed_partitions,
+    )
     return records, images
 
 
@@ -448,11 +525,48 @@ def prepare(
     wider_train, _ = _wider_data(config, "train")
     wider_val, _ = _wider_data(config, "val")
     pairs = parse_xqlfw_pairs(_resolve(config, "xqlfw_pairs"), _resolve(config, "xqlfw_images"))
-    celeba, _ = _celeba_data(config)
-    partitions = {name: [item for item in celeba if item.partition == name] for name in ("train", "val", "test")}
+    profile = profile_name(config)
+    research = profile in RESEARCH_PROFILES
+    celeba, _ = _celeba_data(config, {"train", "val"} if research else None)
+    partitions = {
+        name: [item for item in celeba if item.partition == name]
+        for name in (("train", "val") if research else ("train", "val", "test"))
+    }
+    manifests: dict[tuple[str, str], dict[str, Any]] = {}
+    if research:
+        manifests = ensure_research_manifests(
+            run_dir, celeba, _resolve(config, "celeba_annotations")
+        )
+        selected = {
+            partition: manifests[(profile, partition)]
+            for partition in ("train", "val")
+        }
+        celeba_summary: dict[str, Any] = {
+            name: {
+                "images": int(document["actual_image_count"]),
+                "identities": int(document["actual_identity_count"]),
+                "manifest": str(
+                    Path("manifests")
+                    / f"celeba_{profile.replace('-', '_')}_{name}.json"
+                ),
+                "manifest_sha256": document["content_sha256"],
+            }
+            for name, document in selected.items()
+        }
+        celeba_summary["test"] = {"status": "forbidden", "images_read": 0}
+    else:
+        celeba_summary = {
+            name: {
+                "images": len(items),
+                "identities": len({item.identity for item in items}),
+            }
+            for name, items in partitions.items()
+        }
     summary = {"wider": {"train_images": len(wider_train), "val_images": len(wider_val), "test_used": False},
                "xqlfw": {"pairs": len(pairs), "folds": {str(fold): sum(pair.fold == fold for pair in pairs) for fold in range(10)}},
-               "celeba": {name: {"images": len(items), "identities": len({item.identity for item in items})} for name, items in partitions.items()}}
+               "celeba": celeba_summary,
+               "evaluation_profile": profile,
+               "research_subset": research}
     versions = {}
     for package in ("numpy", "scipy", "opencv-python", "insightface", "onnxruntime-gpu", "faiss-cpu"):
         try:
@@ -461,9 +575,11 @@ def prepare(
             versions[package] = None
     metadata = {"result_schema_version": RESULT_SCHEMA, "experiment_name": config["experiment_name"],
                 "experiment_fingerprint": experiment_fingerprint(config), "source_git_commit": _git_commit(repo_root),
+                "evaluation_profile": profile, "research_subset": research,
                 "seed": int(config["seed"]), "created_at": utc_now(), "host": platform.platform(), "python": platform.python_version(),
                 "model": config["model"], "processing": config["processing"], "package_versions": versions,
-                "preprocessing": {"color_input": "OpenCV BGR", "embedding_normalization": "L2", "celeba_main_face_rule": "maximum IoU"},
+                "preprocessing": {"color_input": "OpenCV BGR", "embedding_normalization": "L2", "celeba_main_face_rule": "maximum IoU then one recognition"},
+                "celeba_manifest_schema": MANIFEST_SCHEMA if research else None,
                 "preflight": preflight_result}
     write_json(run_dir / "resolved_config.json", config)
     write_json(run_dir / "dataset_summary.json", summary)
@@ -504,52 +620,184 @@ def _wider_predictions(
     return records, predictions, stats, skipped
 
 
+def _wider_validation_metrics(
+    config: dict[str, Any],
+    run_dir: Path,
+    runtime: InsightFaceRuntime,
+    progress: ProgressReporter,
+    threshold: float,
+    iou_threshold: float,
+) -> tuple[dict[str, Any], list[str]]:
+    records, predictions, cache, warnings = _wider_predictions(
+        config, run_dir, "val", runtime, progress
+    )
+    operating_point = detector_curve(
+        predictions,
+        [np.asarray(item.boxes) for item in records],
+        [threshold],
+        iou_threshold,
+    )[0]
+    eval_dir = _resolve(config, "wider_eval_tools")
+    if not (eval_dir / "wider_face_val.mat").is_file():
+        matches = list(eval_dir.rglob("wider_face_val.mat")) if eval_dir.is_dir() else []
+        if len(matches) != 1:
+            raise BaselineDataError(
+                f"Не найден однозначный каталог официальной WIDER-разметки MAT внутри {eval_dir}"
+            )
+        eval_dir = matches[0].parent
+    ap = {}
+    for subset in ("easy", "medium", "hard"):
+        keep = load_wider_subset(eval_dir, subset)
+        ap[subset] = wider_compatible_ap(
+            [item.relative_path for item in records],
+            predictions,
+            [np.asarray(item.boxes) for item in records],
+            keep,
+            iou_threshold,
+        )
+    coverage = {
+        **cache,
+        "processed_without_error": cache["items"] - cache["errors"],
+        "coverage": (cache["items"] - cache["errors"]) / max(cache["items"], 1),
+    }
+    result = {
+        "split": "val",
+        "ap_protocol": "strictly compatible with official widerface_evaluate 1000-point protocol",
+        "ap_easy": ap["easy"],
+        "ap_medium": ap["medium"],
+        "ap_hard": ap["hard"],
+        "operating_point": operating_point,
+        "coverage": coverage,
+    }
+    progress.metric(
+        "wider_val",
+        {
+            "ap_easy": ap["easy"],
+            "ap_medium": ap["medium"],
+            "ap_hard": ap["hard"],
+            "operating_point": operating_point,
+            "coverage": cache,
+        },
+    )
+    return result, warnings
+
+
 def _celeba_embeddings(
     config: dict[str, Any],
     run_dir: Path,
     partitions: set[str],
     runtime: InsightFaceRuntime,
+    detector_threshold: float,
     progress: ProgressReporter | None = None,
 ) -> tuple[np.ndarray, list[int], list[str], dict[str, Any], list[str]]:
-    records, images_dir = _celeba_data(config)
-    selected = list(_limit(config, [item for item in records if item.partition in partitions]))
+    profile = profile_name(config)
+    research = profile in RESEARCH_PROFILES
+    if research and not partitions <= {"train", "val"}:
+        raise BaselineDataError(
+            f"Профиль {profile} запрещает чтение и обработку CelebA test"
+        )
+    records, images_dir = _celeba_data(
+        config, {"train", "val"} if research else None
+    )
+    manifest_sha256: str | None = None
+    if research:
+        if len(partitions) != 1:
+            raise BaselineDataError(
+                "Исследовательский профиль обрабатывает train и val раздельно по манифестам"
+            )
+        partition = next(iter(partitions))
+        manifests = ensure_research_manifests(
+            run_dir, records, _resolve(config, "celeba_annotations")
+        )
+        manifest = manifests[(profile, partition)]
+        selected = records_from_manifest(manifest, records)
+        manifest_sha256 = str(manifest["content_sha256"])
+    else:
+        selected = list(
+            _limit(config, [item for item in records if item.partition in partitions])
+        )
     unusable_bbox = [item for item in selected if item.bbox is None]
     eligible = [item for item in selected if item.bbox is not None]
-    cache = DiskCache(run_dir / "cache" / "celeba", experiment_fingerprint(config) + ":celeba:face")
-    observed = {"processed": 0, "main_face_found": 0, "faces": 0}
+    cache_compatibility = {
+        "cache_schema_version": CELEBA_CACHE_SCHEMA,
+        "dataset": "CelebA",
+        "official_partitions": sorted(partitions),
+        "model": config["model"],
+        "preprocessing": "OpenCV BGR; detector once; recognition only after maximum-IoU main-face selection; L2 normalization",
+        "main_face_rule": "maximum_iou_after_detector_threshold",
+        "main_face_min_iou": float(config["celeba"]["main_face_min_iou"]),
+        "detector_threshold": float(detector_threshold),
+        "manifest_schema": MANIFEST_SCHEMA if research else "full_official_partition",
+        "manifest_sha256": manifest_sha256,
+        "profile": profile,
+    }
+    cache_fingerprint = hashlib.sha256(_canonical(cache_compatibility).encode("utf-8")).hexdigest()
+    cache = DiskCache(
+        run_dir
+        / "cache"
+        / "celeba"
+        / CELEBA_CACHE_SCHEMA
+        / cache_fingerprint,
+        cache_fingerprint,
+    )
+    observed = {
+        "processed_images": 0,
+        "detector_candidates": 0,
+        "main_faces_selected": 0,
+        "embeddings_computed": 0,
+        "images_without_main_face": 0,
+        "processing_errors": 0,
+    }
 
     def on_item(index: int, value: dict[str, np.ndarray] | None) -> None:
-        observed["processed"] += 1
+        observed["processed_images"] += 1
         if value is None:
+            observed["processing_errors"] += 1
+            observed["images_without_main_face"] += 1
             return
-        observed["faces"] += len(value["boxes"])
-        observed["main_face_found"] += int(
-            match_main_face(
-                eligible[index].bbox,
-                value["boxes"],
-                float(config["celeba"]["main_face_min_iou"]),
+        candidates = int(np.asarray(value["detector_candidates"]).item())
+        main_selected = int(np.asarray(value["main_face_selected"]).item())
+        embeddings = len(value["embeddings"])
+        if main_selected not in (0, 1) or embeddings not in (0, 1):
+            raise BaselineDataError(
+                f"CelebA {eligible[index].filename}: кэш нарушает ограничение одного главного лица/эмбеддинга"
             )
-            is not None
-        )
+        if embeddings > main_selected:
+            raise BaselineDataError(
+                f"CelebA {eligible[index].filename}: эмбеддинг есть без выбранного главного лица"
+            )
+        observed["detector_candidates"] += candidates
+        observed["main_faces_selected"] += main_selected
+        observed["embeddings_computed"] += embeddings
+        observed["images_without_main_face"] += int(main_selected == 0)
 
     def metrics() -> dict[str, Any]:
-        processed = observed["processed"]
-        return {
-            "найдено_главных_лиц": observed["main_face_found"],
-            "текущее_покрытие": (
-                round(observed["main_face_found"] / processed, 6)
-                if processed
-                else 0.0
-            ),
-            "всего_детекций": observed["faces"],
-        }
+        return dict(observed)
 
     phase = "celeba_" + "+".join(sorted(partitions))
+    def compute(index: int, path: Path) -> dict[str, np.ndarray]:
+        bbox = eligible[index].bbox
+        if bbox is None:
+            raise BaselineDataError("Внутренняя ошибка: вырожденная рамка попала в обработку")
+        return runtime.infer_celeba(
+            path,
+            bbox,
+            float(config["celeba"]["main_face_min_iou"]),
+            float(detector_threshold),
+        )
+
+    class _CelebARuntimeAdapter:
+        def infer(self, image_path: Path, _task: str) -> dict[str, np.ndarray]:
+            index = path_to_index[image_path.resolve()]
+            return compute(index, image_path)
+
+    paths = [images_dir / item.filename for item in eligible]
+    path_to_index = {path.resolve(): index for index, path in enumerate(paths)}
     values, stats, skipped = _process_cached(
-        [images_dir / item.filename for item in eligible],
+        paths,
         cache,
-        runtime,
-        "face",
+        _CelebARuntimeAdapter(),  # type: ignore[arg-type]
+        "celeba_selected_main_face",
         int(config["processing"]["batch_size"]),
         progress,
         phase,
@@ -565,24 +813,38 @@ def _celeba_embeddings(
         *skipped,
     ]
     vectors, labels, names = [], [], []
-    missing_main = 0
     for record, value in zip(eligible, values):
-        if value is None:
+        if value is None or len(value["embeddings"]) == 0:
             continue
-        match = match_main_face(record.bbox, value["boxes"], float(config["celeba"]["main_face_min_iou"]))
-        if match is None:
-            missing_main += 1
-            continue
-        vectors.append(value["embeddings"][match])
+        vectors.append(value["embeddings"][0])
         labels.append(record.identity)
         names.append(record.filename)
+    observed["processed_images"] += len(unusable_bbox)
+    observed["images_without_main_face"] += len(unusable_bbox)
+    if not (
+        observed["embeddings_computed"]
+        <= observed["main_faces_selected"]
+        <= observed["processed_images"]
+    ):
+        raise BaselineDataError(
+            "CelebA: нарушен инвариант embeddings_computed <= "
+            "main_faces_selected <= processed_images"
+        )
     matrix = np.asarray(vectors, dtype=np.float32).reshape(len(vectors), -1) if vectors else np.empty((0, 512), dtype=np.float32)
     coverage = {
-        **stats,
+        **observed,
+        "cache_hits": stats["cache_hits"],
+        "cache_computed": stats["computed"],
+        "cache_schema_version": CELEBA_CACHE_SCHEMA,
+        "cache_compatibility_sha256": cache_fingerprint,
+        "manifest_sha256": manifest_sha256,
+        "evaluation_profile": profile,
+        "research_subset": research,
+        "detector_threshold": float(detector_threshold),
         "selected_images": len(selected),
         "eligible_official_bbox_images": len(eligible),
         "official_bbox_unusable": len(unusable_bbox),
-        "main_face_not_found": missing_main,
+        "main_face_not_found": observed["images_without_main_face"],
         "clustered_images": len(vectors),
         "detector_coverage": len(vectors) / len(eligible) if eligible else 0.0,
         "clustering_coverage": len(vectors) / len(selected) if selected else 0.0,
@@ -655,7 +917,7 @@ def calibrate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: 
     progress.metric("wider_train", {"operating": operating, "high_precision": high_precision,
                                      "coverage": wider_cache})
     vectors, labels, _, celeba_coverage, celeba_warnings = _celeba_embeddings(
-        config, run_dir, {"train"}, runtime, progress
+        config, run_dir, {"train"}, runtime, float(operating["threshold"]), progress
     )
     celeba_rows = _celeba_threshold_results(vectors, labels, config)
     write_json(run_dir / "calibration" / "celeba_train_candidates.json", celeba_rows)
@@ -667,7 +929,8 @@ def calibrate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: 
                                       "mean_same_similarity": float(np.mean(scores[pair_labels])),
                                       "mean_different_similarity": float(np.mean(scores[~pair_labels]))})
     result = {"wider": {"split": "train", "operating": operating, "high_precision": high_precision, "cache": wider_cache},
-              "celeba": {"split": "train", "candidates": celeba_rows, "coverage": celeba_coverage},
+              "celeba": {"split": "train", "candidates": celeba_rows, "coverage": celeba_coverage,
+                         "evaluation_scope": "research_subset" if is_research_profile(config) else "full_official_partition"},
               "xqlfw": {"prepared_scores": len(scores), "cache": xqlfw_cache}}
     write_json(run_dir / "calibration" / "summary.json", result)
     stage = _save_stage(run_dir, "calibrate", started, result, [*warnings, *celeba_warnings, *xqlfw_warnings])
@@ -678,10 +941,17 @@ def calibrate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: 
 def validate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: float = 30.0) -> dict[str, Any]:
     started = time.monotonic()
     progress = ProgressReporter(run_dir, "validate", progress_interval_seconds)
-    _require_stage(run_dir, "calibrate")
+    calibration = _require_stage(run_dir, "calibrate")["outputs"]
     _ensure_run_compatible(run_dir, config)
     runtime = InsightFaceRuntime(config["model"])
-    vectors, labels, _, coverage, warnings = _celeba_embeddings(config, run_dir, {"val"}, runtime, progress)
+    vectors, labels, _, coverage, warnings = _celeba_embeddings(
+        config,
+        run_dir,
+        {"val"},
+        runtime,
+        float(calibration["wider"]["operating"]["threshold"]),
+        progress,
+    )
     candidates = _celeba_threshold_results(vectors, labels, config)
     selected = _select_celeba(candidates)
     with np.load(run_dir / "calibration" / "xqlfw_scores.npz", allow_pickle=False) as saved:
@@ -691,22 +961,53 @@ def validate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: f
                                                 "accuracy_std": xqlfw["accuracy_std"],
                                                 "roc_auc": xqlfw["roc_auc"], "eer": xqlfw["eer"],
                                                 "verification_threshold": xqlfw["verification_threshold"]})
-    result = {"celeba": {"split": "val", "candidates": candidates, "selected_configuration": selected, "coverage": coverage},
+    wider_result: dict[str, Any] | None = None
+    wider_warnings: list[str] = []
+    if is_research_profile(config):
+        wider_result, wider_warnings = _wider_validation_metrics(
+            config,
+            run_dir,
+            runtime,
+            progress,
+            float(calibration["wider"]["operating"]["threshold"]),
+            float(config["wider"]["iou_threshold"]),
+        )
+    result = {"celeba": {"split": "val", "candidates": candidates, "selected_configuration": selected, "coverage": coverage,
+                         "evaluation_scope": "research_subset" if is_research_profile(config) else "full_official_partition"},
               "xqlfw": xqlfw}
+    if wider_result is not None:
+        result["wider"] = wider_result
     write_json(run_dir / "validation" / "summary.json", result)
-    stage = _save_stage(run_dir, "validate", started, result, [*warnings, *xqlfw.get("warnings", [])])
+    stage = _save_stage(
+        run_dir,
+        "validate",
+        started,
+        result,
+        [*warnings, *wider_warnings, *xqlfw.get("warnings", [])],
+    )
     progress.complete(float(stage["elapsed_seconds"]))
     return stage
 
 
 def freeze(config: dict[str, Any], run_dir: Path, progress_interval_seconds: float = 30.0) -> dict[str, Any]:
+    if is_research_profile(config):
+        raise BaselineDataError(
+            f"Профиль {profile_name(config)} завершается после validate; freeze разрешён только для full"
+        )
     started = time.monotonic()
     progress = ProgressReporter(run_dir, "freeze", progress_interval_seconds)
     calibration = _require_stage(run_dir, "calibrate")["outputs"]
     validation = _require_stage(run_dir, "validate")["outputs"]
     _ensure_run_compatible(run_dir, config)
     runtime = InsightFaceRuntime(config["model"])
-    vectors, labels, _, coverage, warnings = _celeba_embeddings(config, run_dir, {"train", "val"}, runtime, progress)
+    vectors, labels, _, coverage, warnings = _celeba_embeddings(
+        config,
+        run_dir,
+        {"train", "val"},
+        runtime,
+        float(calibration["wider"]["operating"]["threshold"]),
+        progress,
+    )
     recalibrated = _select_celeba(_celeba_threshold_results(vectors, labels, config))
     frozen = {"frozen_schema_version": FROZEN_SCHEMA, "created_at": utc_now(),
               "experiment_name": config["experiment_name"], "experiment_fingerprint": experiment_fingerprint(config),
@@ -747,6 +1048,11 @@ def evaluate(
     progress_interval_seconds: float = 30.0,
 ) -> dict[str, Any]:
     """Итоговая оценка. Эта функция принципиально не вызывает подбор порогов."""
+    if is_research_profile(config):
+        raise BaselineDataError(
+            f"Профиль {profile_name(config)} запрещает evaluate и доступ к CelebA test; "
+            "официальная итоговая оценка доступна только для full"
+        )
     started = time.monotonic()
     progress = ProgressReporter(run_dir, "evaluate", progress_interval_seconds)
     _require_stage(run_dir, "prepare")
@@ -756,26 +1062,22 @@ def evaluate(
     frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
     validate_frozen(frozen, config)
     runtime = InsightFaceRuntime(config["model"])
-    wider_records, predictions, wider_cache, warnings = _wider_predictions(config, run_dir, "val", runtime, progress)
     threshold = float(frozen["wider"]["confidence_threshold"])
-    curve_at_frozen = detector_curve(predictions, [np.asarray(item.boxes) for item in wider_records], [threshold], float(frozen["wider"]["iou_threshold"]))[0]
-    eval_dir = _resolve(config, "wider_eval_tools")
-    if not (eval_dir / "wider_face_val.mat").is_file():
-        matches = list(eval_dir.rglob("wider_face_val.mat")) if eval_dir.is_dir() else []
-        if len(matches) != 1:
-            raise BaselineDataError(f"Не найден однозначный каталог официальной WIDER-разметки MAT внутри {eval_dir}")
-        eval_dir = matches[0].parent
-    ap = {}
-    for subset in ("easy", "medium", "hard"):
-        keep = load_wider_subset(eval_dir, subset)
-        ap[subset] = wider_compatible_ap([item.relative_path for item in wider_records], predictions,
-                                         [np.asarray(item.boxes) for item in wider_records], keep,
-                                         float(frozen["wider"]["iou_threshold"]))
-    progress.metric("wider_val", {"ap_easy": ap["easy"], "ap_medium": ap["medium"],
-                                   "ap_hard": ap["hard"], "operating_point": curve_at_frozen,
-                                   "coverage": wider_cache})
+    wider_result, warnings = _wider_validation_metrics(
+        config,
+        run_dir,
+        runtime,
+        progress,
+        threshold,
+        float(frozen["wider"]["iou_threshold"]),
+    )
     vectors, labels, _, celeba_coverage, celeba_warnings = _celeba_embeddings(
-        config, run_dir, {"test"}, runtime, progress
+        config,
+        run_dir,
+        {"test"},
+        runtime,
+        float(frozen["wider"]["confidence_threshold"]),
+        progress,
     )
     predicted = scalable_threshold_clusters(vectors, float(frozen["celeba"]["clustering_threshold"]),
                                             int(config["celeba"]["cluster_block_size"]), int(frozen["celeba"]["ann_neighbors"]), int(config["seed"]))
@@ -792,10 +1094,7 @@ def evaluate(
                                       "roc_auc": xqlfw_metrics["roc_auc"], "eer": xqlfw_metrics["eer"],
                                       "tar_at_far": xqlfw_metrics["tar_at_far"]})
     result = {"result_schema_version": RESULT_SCHEMA,
-              "wider": {"split": "val", "ap_protocol": "strictly compatible with official widerface_evaluate 1000-point protocol",
-                        "ap_easy": ap["easy"], "ap_medium": ap["medium"], "ap_hard": ap["hard"],
-                        "operating_point": curve_at_frozen, "coverage": {**wider_cache, "processed_without_error": wider_cache["items"] - wider_cache["errors"],
-                                                                         "coverage": (wider_cache["items"] - wider_cache["errors"]) / max(wider_cache["items"], 1)}},
+              "wider": wider_result,
               "xqlfw": {**xqlfw_metrics, "cache": xqlfw_cache},
               "celeba": {"split": "test", "metrics": celeba_metrics, "coverage": celeba_coverage,
                          "predicted_clusters": int(len(np.unique(predicted)))}}
@@ -803,8 +1102,8 @@ def evaluate(
     write_json(run_dir / "evaluation" / "metrics.json", result)
     write_json(run_dir / "evaluation" / "warnings.json", all_warnings)
     report = ["# Итоговая оценка baseline", "", f"Создано: {utc_now()}", "",
-              f"WIDER FACE val: AP Easy={ap['easy']:.6f}, Medium={ap['medium']:.6f}, Hard={ap['hard']:.6f}",
-              f"WIDER F1 при замороженном пороге: {float(curve_at_frozen['f1']):.6f}",
+              f"WIDER FACE val: AP Easy={float(wider_result['ap_easy']):.6f}, Medium={float(wider_result['ap_medium']):.6f}, Hard={float(wider_result['ap_hard']):.6f}",
+              f"WIDER F1 при замороженном пороге: {float(wider_result['operating_point']['f1']):.6f}",
               f"XQLFW ROC AUC={float(xqlfw_metrics['roc_auc']):.6f}, EER={float(xqlfw_metrics['eer']):.6f}",
               f"CelebA test B-cubed F1={float(celeba_metrics['all_identities']['bcubed_f1']):.6f}", "",
               "Подробные значения находятся в metrics.json."]

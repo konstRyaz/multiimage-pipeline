@@ -40,6 +40,11 @@ faces.csv + embeddings.npy + aligned_faces/
 `prepare → calibrate → validate → freeze → evaluate` описан в
 [`docs/baseline_evaluation.md`](docs/baseline_evaluation.md). Итоговая оценка
 обязательно принимает заранее замороженные раздельные пороги компонентов.
+Для регулярных исследований используйте `scripts/run_baseline_profile_1gpu.sh`:
+профили `smoke`, `dev-a` и `dev-b` сохраняют полные WIDER FACE и XQLFW,
+ограничивают только CelebA по детерминированным группам целых личностей и
+завершаются после `validate`. Профиль `full` сохраняет полный пятистадийный
+протокол.
 
 Исходные `faces.csv`, `embeddings.npy` и `aligned_faces/` последующие этапы не
 изменяют.
