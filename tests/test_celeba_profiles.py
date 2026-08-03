@@ -11,7 +11,12 @@ from unittest import mock
 
 import numpy as np
 
-from face_pipeline.baseline_data import BaselineDataError, CelebARecord
+from face_pipeline.baseline_data import (
+    BaselineDataError,
+    CelebARecord,
+    WiderImage,
+    XqlfwPair,
+)
 from face_pipeline.baseline_workflow import (
     CELEBA_CACHE_SCHEMA,
     DiskCache,
@@ -24,12 +29,17 @@ from face_pipeline.baseline_workflow import (
 from face_pipeline.celeba_profiles import (
     MANIFEST_SCHEMA,
     PROFILE_LIMITS,
+    SMOKE_WIDER_LIMITS,
+    SMOKE_XQLFW_PAIRS_PER_CLASS_PER_FOLD,
     apply_profile,
     build_profile_selections,
     ensure_research_manifests,
     manifest_filename,
     records_from_manifest,
+    select_wider_records,
+    select_xqlfw_pairs,
     validate_manifest,
+    xqlfw_expected_fold_size,
 )
 from src.baseline_evaluate import build_parser
 
@@ -323,6 +333,47 @@ class CelebARecognitionAndCacheTests(unittest.TestCase):
 
 
 class ProfileInterfaceTests(unittest.TestCase):
+    def test_smoke_bounds_wider_and_xqlfw_deterministically(self) -> None:
+        config = {"evaluation_profile": "smoke"}
+        wider = [WiderImage(f"event/{index}.jpg", ()) for index in range(200)]
+        first_wider = select_wider_records(config, wider, "train")
+        second_wider = select_wider_records(config, list(reversed(wider)), "train")
+        self.assertEqual(first_wider, second_wider)
+        self.assertEqual(len(first_wider), SMOKE_WIDER_LIMITS["train"])
+
+        pairs = []
+        for fold in range(10):
+            for same in (True, False):
+                for index in range(20):
+                    pairs.append(
+                        XqlfwPair(
+                            Path(f"{fold}/{int(same)}/{index}_left.jpg"),
+                            Path(f"{fold}/{int(same)}/{index}_right.jpg"),
+                            same,
+                            fold,
+                        )
+                    )
+        first_pairs = select_xqlfw_pairs(config, pairs)
+        second_pairs = select_xqlfw_pairs(config, list(reversed(pairs)))
+        self.assertEqual(first_pairs, second_pairs)
+        self.assertEqual(
+            len(first_pairs), 20 * SMOKE_XQLFW_PAIRS_PER_CLASS_PER_FOLD
+        )
+        for fold in range(10):
+            fold_pairs = [pair for pair in first_pairs if pair.fold == fold]
+            self.assertEqual(sum(pair.same for pair in fold_pairs), 5)
+            self.assertEqual(sum(not pair.same for pair in fold_pairs), 5)
+        self.assertEqual(xqlfw_expected_fold_size(config), 10)
+
+    def test_non_smoke_profiles_keep_complete_wider_and_xqlfw(self) -> None:
+        wider = [WiderImage(f"{index}.jpg", ()) for index in range(100)]
+        pairs = [XqlfwPair(Path("left"), Path("right"), True, 0)]
+        for profile in ("dev-a", "dev-b", "full"):
+            config = {} if profile == "full" else {"evaluation_profile": profile}
+            self.assertEqual(select_wider_records(config, wider, "train"), wider)
+            self.assertEqual(select_xqlfw_pairs(config, pairs), pairs)
+            self.assertEqual(xqlfw_expected_fold_size(config), 600)
+
     def test_cli_parses_profiles_and_full_keeps_old_fingerprint(self) -> None:
         args = build_parser().parse_args(
             [
@@ -342,6 +393,12 @@ class ProfileInterfaceTests(unittest.TestCase):
         apply_profile(config, "full")
         self.assertNotIn("evaluation_profile", config)
         self.assertEqual(before, experiment_fingerprint(config))
+
+    def test_smoke_has_a_separate_cache_fingerprint_schema(self) -> None:
+        config = small_config(Path("/tmp/fixture"))
+        smoke_fingerprint = experiment_fingerprint(config)
+        config["evaluation_profile"] = "dev-a"
+        self.assertNotEqual(smoke_fingerprint, experiment_fingerprint(config))
 
     def test_research_evaluate_fails_before_test_or_frozen_access(self) -> None:
         config = small_config(Path("/path/that/must/not/be/read"))

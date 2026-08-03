@@ -88,21 +88,26 @@ def xqlfw_cross_validation(
     labels: Sequence[bool],
     folds: Sequence[int],
     fars: Sequence[float] = (0.1, 0.01, 0.001, 0.0001),
+    expected_fold_size: int = 600,
 ) -> dict[str, object]:
     scores_array = np.asarray(scores, dtype=np.float64)
     labels_array = np.asarray(labels, dtype=bool)
     folds_array = np.asarray(folds, dtype=np.int64)
     results = []
+    calibration_size = expected_fold_size * 9
     for fold in range(10):
         train = folds_array != fold
         test = folds_array == fold
-        if int(test.sum()) != 600 or int(train.sum()) != 5400:
+        if int(test.sum()) != expected_fold_size or int(train.sum()) != calibration_size:
             raise ValueError(f"XQLFW: блок {fold} имеет неверный размер")
+        fold_labels = labels_array[test]
+        if int(fold_labels.sum()) * 2 != expected_fold_size:
+            raise ValueError(f"XQLFW: блок {fold} должен быть сбалансирован по классам")
         threshold, calibration = best_accuracy_threshold(scores_array[train], labels_array[train])
         metrics = precision_recall_f1(labels_array[test], scores_array[test] >= threshold)
-        results.append({"fold": fold, "calibration_records": 5400, "evaluation_records": 600,
+        results.append({"fold": fold, "calibration_records": calibration_size, "evaluation_records": expected_fold_size,
                         "threshold": threshold, "calibration": calibration, "evaluation": metrics,
-                        "accuracy": (int(metrics["tp"]) + int(metrics["tn"])) / 600.0})
+                        "accuracy": (int(metrics["tp"]) + int(metrics["tn"])) / expected_fold_size})
     accuracies = np.asarray([float(item["accuracy"]) for item in results])
     thresholds = np.asarray([float(item["threshold"]) for item in results])
     return {"folds": results, "accuracy_mean": float(np.mean(accuracies)), "accuracy_std": float(np.std(accuracies)),

@@ -6,18 +6,21 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from .baseline_data import BaselineDataError, CelebARecord
+from .baseline_data import BaselineDataError, CelebARecord, WiderImage, XqlfwPair
 
 
 MANIFEST_SCHEMA = "celeba_profile_manifest_v1"
 MANIFEST_SEED = 20260803
+SMOKE_PROFILE_SCHEMA = "technical_smoke_profile_v2"
 RESEARCH_PROFILES = ("smoke", "dev-a", "dev-b")
 ALL_PROFILES = (*RESEARCH_PROFILES, "full")
 PROFILE_LIMITS = {
-    "smoke": {"train": 1_000, "val": 300},
+    "smoke": {"train": 64, "val": 32},
     "dev-a": {"train": 10_000, "val": 3_000},
     "dev-b": {"train": 10_000, "val": 3_000},
 }
+SMOKE_WIDER_LIMITS = {"train": 64, "val": 32}
+SMOKE_XQLFW_PAIRS_PER_CLASS_PER_FOLD = 5
 SOURCE_ANNOTATIONS = (
     "identity_CelebA.txt",
     "list_eval_partition.txt",
@@ -50,6 +53,71 @@ def apply_profile(config: dict[str, Any], profile: str) -> dict[str, Any]:
     else:
         config["evaluation_profile"] = profile
     return config
+
+
+def _smoke_key(*values: object) -> str:
+    raw = "\x1f".join(
+        (MANIFEST_SCHEMA, str(MANIFEST_SEED), "smoke", *(str(value) for value in values))
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def select_wider_records(
+    config: Mapping[str, Any], records: Sequence[WiderImage], split: str
+) -> list[WiderImage]:
+    """Return a deterministic bounded WIDER subset only for the smoke profile."""
+    if profile_name(config) != "smoke":
+        return list(records)
+    limit = SMOKE_WIDER_LIMITS[split]
+    return sorted(
+        records,
+        key=lambda item: (_smoke_key("wider", split, item.relative_path), item.relative_path),
+    )[:limit]
+
+
+def select_xqlfw_pairs(
+    config: Mapping[str, Any], pairs: Sequence[XqlfwPair]
+) -> list[XqlfwPair]:
+    """Keep a balanced deterministic sample from every XQLFW fold for smoke."""
+    if profile_name(config) != "smoke":
+        return list(pairs)
+    selected: list[XqlfwPair] = []
+    for fold in range(10):
+        for same in (True, False):
+            candidates = [
+                pair for pair in pairs if pair.fold == fold and pair.same is same
+            ]
+            candidates.sort(
+                key=lambda pair: (
+                    _smoke_key(
+                        "xqlfw",
+                        fold,
+                        int(same),
+                        pair.left.as_posix(),
+                        pair.right.as_posix(),
+                    ),
+                    pair.left.as_posix(),
+                    pair.right.as_posix(),
+                )
+            )
+            required = SMOKE_XQLFW_PAIRS_PER_CLASS_PER_FOLD
+            if len(candidates) < required:
+                raise BaselineDataError(
+                    f"XQLFW smoke: в блоке {fold} недостаточно пар класса "
+                    f"same={same}: {len(candidates)} < {required}"
+                )
+            selected.extend(candidates[:required])
+    return selected
+
+
+def xqlfw_expected_fold_size(config: Mapping[str, Any]) -> int:
+    if profile_name(config) == "smoke":
+        return 2 * SMOKE_XQLFW_PAIRS_PER_CLASS_PER_FOLD
+    return 600
+
+
+def smoke_profile_schema(config: Mapping[str, Any]) -> str | None:
+    return SMOKE_PROFILE_SCHEMA if profile_name(config) == "smoke" else None
 
 
 def _canonical(value: Any) -> bytes:
@@ -287,4 +355,3 @@ def records_from_manifest(
             )
         selected.append(record)
     return selected
-

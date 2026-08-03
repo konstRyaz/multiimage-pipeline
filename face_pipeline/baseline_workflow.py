@@ -40,6 +40,10 @@ from .celeba_profiles import (
     is_research_profile,
     profile_name,
     records_from_manifest,
+    select_wider_records,
+    select_xqlfw_pairs,
+    smoke_profile_schema,
+    xqlfw_expected_fold_size,
 )
 from .io import write_csv, write_json
 
@@ -217,6 +221,9 @@ def experiment_fingerprint(config: dict[str, Any]) -> str:
     relevant = {key: config[key] for key in ("config_schema_version", "experiment_name", "seed", "model", "processing", "wider", "xqlfw", "celeba")}
     if "evaluation_profile" in config:
         relevant["evaluation_profile"] = config["evaluation_profile"]
+    smoke_schema = smoke_profile_schema(config)
+    if smoke_schema is not None:
+        relevant["smoke_profile_schema"] = smoke_schema
     return hashlib.sha256(_canonical(relevant).encode("utf-8")).hexdigest()
 
 
@@ -522,9 +529,12 @@ def prepare(
     run_dir.mkdir(parents=True, exist_ok=True)
     progress = ProgressReporter(run_dir, "prepare", progress_interval_seconds)
     preflight_result = preflight(config, run_dir, check_model=False)
-    wider_train, _ = _wider_data(config, "train")
-    wider_val, _ = _wider_data(config, "val")
-    pairs = parse_xqlfw_pairs(_resolve(config, "xqlfw_pairs"), _resolve(config, "xqlfw_images"))
+    wider_train = select_wider_records(config, _wider_data(config, "train")[0], "train")
+    wider_val = select_wider_records(config, _wider_data(config, "val")[0], "val")
+    pairs = select_xqlfw_pairs(
+        config,
+        parse_xqlfw_pairs(_resolve(config, "xqlfw_pairs"), _resolve(config, "xqlfw_images")),
+    )
     profile = profile_name(config)
     research = profile in RESEARCH_PROFILES
     celeba, _ = _celeba_data(config, {"train", "val"} if research else None)
@@ -566,7 +576,8 @@ def prepare(
                "xqlfw": {"pairs": len(pairs), "folds": {str(fold): sum(pair.fold == fold for pair in pairs) for fold in range(10)}},
                "celeba": celeba_summary,
                "evaluation_profile": profile,
-               "research_subset": research}
+               "research_subset": research,
+               "technical_smoke_only": profile == "smoke"}
     versions = {}
     for package in ("numpy", "scipy", "opencv-python", "insightface", "onnxruntime-gpu", "faiss-cpu"):
         try:
@@ -576,6 +587,7 @@ def prepare(
     metadata = {"result_schema_version": RESULT_SCHEMA, "experiment_name": config["experiment_name"],
                 "experiment_fingerprint": experiment_fingerprint(config), "source_git_commit": _git_commit(repo_root),
                 "evaluation_profile": profile, "research_subset": research,
+                "technical_smoke_only": profile == "smoke",
                 "seed": int(config["seed"]), "created_at": utc_now(), "host": platform.platform(), "python": platform.python_version(),
                 "model": config["model"], "processing": config["processing"], "package_versions": versions,
                 "preprocessing": {"color_input": "OpenCV BGR", "embedding_normalization": "L2", "celeba_main_face_rule": "maximum IoU then one recognition"},
@@ -598,7 +610,7 @@ def _wider_predictions(
     progress: ProgressReporter | None = None,
 ) -> tuple[list[WiderImage], list[np.ndarray], dict[str, int], list[str]]:
     records, images_dir = _wider_data(config, split)
-    records = list(_limit(config, records))
+    records = list(_limit(config, select_wider_records(config, records, split)))
     cache = DiskCache(run_dir / "cache" / "wider" / split, experiment_fingerprint(config) + ":wider:detection")
     observed = {"processed": 0, "detections": 0, "images_with_detections": 0}
     def on_item(_index: int, value: dict[str, np.ndarray] | None) -> None:
@@ -663,6 +675,11 @@ def _wider_validation_metrics(
     result = {
         "split": "val",
         "ap_protocol": "strictly compatible with official widerface_evaluate 1000-point protocol",
+        "evaluation_scope": (
+            "technical_smoke_subset"
+            if profile_name(config) == "smoke"
+            else "full_official_partition"
+        ),
         "ap_easy": ap["easy"],
         "ap_medium": ap["medium"],
         "ap_hard": ap["hard"],
@@ -870,7 +887,10 @@ def _xqlfw_scores(
     runtime: InsightFaceRuntime,
     progress: ProgressReporter | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any], list[str]]:
-    pairs = parse_xqlfw_pairs(_resolve(config, "xqlfw_pairs"), _resolve(config, "xqlfw_images"))
+    pairs = select_xqlfw_pairs(
+        config,
+        parse_xqlfw_pairs(_resolve(config, "xqlfw_pairs"), _resolve(config, "xqlfw_images")),
+    )
     paths = sorted({path.resolve() for pair in pairs for path in (pair.left, pair.right)}, key=str)
     cache = DiskCache(run_dir / "cache" / "xqlfw", experiment_fingerprint(config) + ":xqlfw:face")
     observed = {"processed": 0, "usable": 0}
@@ -931,7 +951,8 @@ def calibrate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: 
     result = {"wider": {"split": "train", "operating": operating, "high_precision": high_precision, "cache": wider_cache},
               "celeba": {"split": "train", "candidates": celeba_rows, "coverage": celeba_coverage,
                          "evaluation_scope": "research_subset" if is_research_profile(config) else "full_official_partition"},
-              "xqlfw": {"prepared_scores": len(scores), "cache": xqlfw_cache}}
+              "xqlfw": {"prepared_scores": len(scores), "cache": xqlfw_cache},
+              "technical_smoke_only": profile_name(config) == "smoke"}
     write_json(run_dir / "calibration" / "summary.json", result)
     stage = _save_stage(run_dir, "calibrate", started, result, [*warnings, *celeba_warnings, *xqlfw_warnings])
     progress.complete(float(stage["elapsed_seconds"]))
@@ -955,7 +976,13 @@ def validate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: f
     candidates = _celeba_threshold_results(vectors, labels, config)
     selected = _select_celeba(candidates)
     with np.load(run_dir / "calibration" / "xqlfw_scores.npz", allow_pickle=False) as saved:
-        xqlfw = xqlfw_cross_validation(saved["scores"], saved["labels"], saved["folds"], config["xqlfw"]["far_values"])
+        xqlfw = xqlfw_cross_validation(
+            saved["scores"],
+            saved["labels"],
+            saved["folds"],
+            config["xqlfw"]["far_values"],
+            expected_fold_size=xqlfw_expected_fold_size(config),
+        )
     progress.metric("celeba_val", {"selected_configuration": selected, "coverage": coverage})
     progress.metric("xqlfw_cross_validation", {"accuracy_mean": xqlfw["accuracy_mean"],
                                                 "accuracy_std": xqlfw["accuracy_std"],
@@ -977,6 +1004,8 @@ def validate(config: dict[str, Any], run_dir: Path, progress_interval_seconds: f
               "xqlfw": xqlfw}
     if wider_result is not None:
         result["wider"] = wider_result
+    if profile_name(config) == "smoke":
+        result["technical_smoke_only"] = True
     write_json(run_dir / "validation" / "summary.json", result)
     stage = _save_stage(
         run_dir,
